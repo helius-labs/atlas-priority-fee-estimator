@@ -14,6 +14,7 @@ use yellowstone_grpc_proto::prelude::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest, SubscribeRequestFilterBlocks,
     SubscribeRequestPing,
 };
+use yellowstone_grpc_proto::tonic::codec::CompressionEncoding;
 
 use crate::grpc_consumer::GrpcConsumer;
 
@@ -54,6 +55,7 @@ impl GrpcGeyserImpl {
                         .unwrap()
                         .connect_timeout(Duration::from_secs(10))
                         .max_decoding_message_size(50_000_000)
+                        .accept_compressed(CompressionEncoding::Gzip)
                         .connect()
                         .await;
 
