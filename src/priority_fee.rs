@@ -1,5 +1,6 @@
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
@@ -90,7 +91,7 @@ impl SlotPriorityFees {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PriorityFeeTracker {
     priority_fees: Arc<PriorityFeesBySlot>,
     compute_budget: ComputeBudget,
@@ -101,18 +102,23 @@ impl GrpcConsumer for PriorityFeeTracker {
     fn consume(&self, update: &SubscribeUpdate) -> Result<(), String> {
         match update.update_oneof.clone() {
             Some(UpdateOneof::Block(block)) => {
+                statsd_count!("blocks_processed", 1);
+                statsd_count!("txns_received", block.transactions.len() as i64);
                 let slot = block.slot;
                 for txn in block.transactions {
                     // skip failed txs
                     if txn.meta.map_or(false, |meta| meta.err.is_some()) {
+                        statsd_count!("txn_failed", 1);
                         return Ok(());
                     }
                     if txn.transaction.is_none() {
+                        statsd_count!("txn_missing", 1);
                         continue;
                     }
                     let transaction = txn.transaction.unwrap();
                     let message = transaction.message;
                     if message.is_none() {
+                        statsd_count!("message_missing", 1);
                         continue;
                     }
                     let message = message.unwrap();
@@ -124,6 +130,9 @@ impl GrpcConsumer for PriorityFeeTracker {
                         .into_iter()
                         .filter_map(|p| {
                             let pubkey: Option<[u8; 32]> = p.try_into().ok();
+                            if pubkey.is_none() {
+                                statsd_count!("invalid_pubkey", 1);
+                            }
                             pubkey
                         })
                         .map(|p| Pubkey::new_from_array(p))
@@ -146,6 +155,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                             .filter_map(|ix| {
                                 let account = accounts.get(ix.program_id_index as usize);
                                 if account.is_none() {
+                                    statsd_count!("program_id_index_not_found", 1);
                                     return None;
                                 }
                                 Some((account.unwrap(), ix))
@@ -160,6 +170,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                         true,
                         true,
                     );
+                    statsd_count!("txns_processed", 1);
                     match priority_fee_details {
                         Ok(priority_fee_details) => self.push_priority_fee_for_txn(
                             slot,
@@ -186,7 +197,45 @@ impl PriorityFeeTracker {
             slot_cache: SlotCache::new(slot_cache_length),
             compute_budget: ComputeBudget::default(),
         };
+        tracker.poll_fees();
         tracker
+    }
+
+    fn poll_fees(&self) {
+        let priority_fee_tracker = self.clone();
+        tokio::spawn(async move {
+            loop {
+                let global_fees =
+                    priority_fee_tracker.get_priority_fee_estimates(vec![], false, None);
+                statsd_gauge!(
+                    "min_priority_fee",
+                    global_fees.min as u64,
+                    "account" => "none"
+                );
+                statsd_gauge!("low_priority_fee", global_fees.low as u64, "account" => "none");
+                statsd_gauge!(
+                    "medium_priority_fee",
+                    global_fees.medium as u64,
+                    "account" => "none"
+                );
+                statsd_gauge!(
+                    "high_priority_fee",
+                    global_fees.high as u64,
+                    "account" => "none"
+                );
+                statsd_gauge!(
+                    "very_high_priority_fee",
+                    global_fees.very_high as u64,
+                    "account" => "none"
+                );
+                statsd_gauge!(
+                    "unsafe_max_priority_fee",
+                    global_fees.unsafe_max as u64,
+                    "account" => "none"
+                );
+                tokio::time::sleep(Duration::from_millis(1000)).await
+            }
+        });
     }
 
     fn push_priority_fee_for_txn(
@@ -348,8 +397,8 @@ mod tests {
         set_global_default(client)
     }
 
-    #[test]
-    fn test_specific_fee_estimates() {
+    #[tokio::test]
+    async fn test_specific_fee_estimates() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(10);
 
@@ -387,8 +436,8 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
-    #[test]
-    fn test_with_many_slots() {
+    #[tokio::test]
+    async fn test_with_many_slots() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(101);
 
@@ -427,8 +476,8 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
-    #[test]
-    fn test_with_many_slots_broken() {
+    #[tokio::test]
+    async fn test_with_many_slots_broken() {
         // same test as above but with an extra slot to throw off the value
         init_metrics();
         let tracker = PriorityFeeTracker::new(102);
@@ -464,8 +513,8 @@ mod tests {
         assert_ne!(estimates.very_high, expected_very_high_fee);
     }
 
-    #[test]
-    fn test_exclude_vote() {
+    #[tokio::test]
+    async fn test_exclude_vote() {
         let tracker = PriorityFeeTracker::new(10);
 
         let mut fees = vec![];

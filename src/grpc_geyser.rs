@@ -81,7 +81,10 @@ impl GrpcGeyserImpl {
                     match update {
                         Ok(update) => {
                             for consumer in consumers.clone() {
-                                consumer.consume(&update);
+                                if let Err(e) = consumer.consume(&update) {
+                                    error!("Error consuming update: {}", e);
+                                    statsd_count!("grpc_consume_error", 1);
+                                }
                             }
                             match update.update_oneof {
                                 Some(UpdateOneof::Ping(_)) => {
