@@ -109,7 +109,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                     // skip failed txs
                     if txn.meta.map_or(false, |meta| meta.err.is_some()) {
                         statsd_count!("txn_failed", 1);
-                        return Ok(());
+                        continue;
                     }
                     if txn.transaction.is_none() {
                         statsd_count!("txn_missing", 1);
