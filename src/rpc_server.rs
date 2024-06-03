@@ -279,14 +279,9 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
                 });
             }
         }
-        let recommended = options.map_or(false, |o| o.recommended.unwrap_or(false));
-        let min_priority_fee = 10_000 as f64;
+        let recommended = options.map_or(false, |o: GetPriorityFeeEstimateOptions| o.recommended.unwrap_or(false));
         let priority_fee = if recommended {
-            if priority_fee_levels.medium > min_priority_fee {
-                priority_fee_levels.medium
-            } else {
-                min_priority_fee
-            }
+            get_recommended_fee(priority_fee_levels)
         } else {
             priority_fee_levels.medium
         };
@@ -318,4 +313,14 @@ fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool 
         return options.include_vote.unwrap_or(true) || !options.recommended.unwrap_or(false);
     }
     true
+}
+
+const MIN_RECOMMENDED_PRIORITY_FEE: f64 = 10_000.0;
+
+pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates) -> f64 {
+    if priority_fee_levels.medium > MIN_RECOMMENDED_PRIORITY_FEE {
+        priority_fee_levels.medium
+    } else {
+        MIN_RECOMMENDED_PRIORITY_FEE
+    }
 }
