@@ -15,6 +15,7 @@ use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
 
 use crate::grpc_consumer::GrpcConsumer;
+use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
 
 #[derive(Deserialize, Clone)]
@@ -231,6 +232,11 @@ impl PriorityFeeTracker {
                 statsd_gauge!(
                     "unsafe_max_priority_fee",
                     global_fees.unsafe_max as u64,
+                    "account" => "none"
+                );
+                statsd_gauge!(
+                    "recommended_priority_fee",
+                    get_recommended_fee(global_fees) as u64,
                     "account" => "none"
                 );
                 tokio::time::sleep(Duration::from_millis(1000)).await
