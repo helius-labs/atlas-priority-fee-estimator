@@ -310,7 +310,7 @@ impl AtlasPriorityFeeEstimator {
 // default to true for backwards compatibility. Recommended fee does not include vote txns
 fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool {
     if let Some(options) = options {
-        return options.include_vote.unwrap_or(true) || !options.recommended.unwrap_or(false);
+        return options.include_vote.unwrap_or(false);
     }
     true
 }
