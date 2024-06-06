@@ -317,10 +317,15 @@ fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool 
 
 const MIN_RECOMMENDED_PRIORITY_FEE: f64 = 10_000.0;
 
+// Safety buffer on the recommended fee to cover cases where the priority fee is increasing over each block. 
+const RECOMMENDED_FEE_SAFETY_BUFFER: f64 = 0.05;
+
 pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates) -> f64 {
-    if priority_fee_levels.medium > MIN_RECOMMENDED_PRIORITY_FEE {
+    let recommended = if priority_fee_levels.medium > MIN_RECOMMENDED_PRIORITY_FEE {
         priority_fee_levels.medium
     } else {
         MIN_RECOMMENDED_PRIORITY_FEE
-    }
+    };
+    let recommended_with_buffer = recommended * (1.0 + RECOMMENDED_FEE_SAFETY_BUFFER);
+    recommended_with_buffer.ceil()
 }
