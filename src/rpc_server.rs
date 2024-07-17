@@ -3,6 +3,7 @@ use std::{
     env, fmt,
     str::FromStr,
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -10,6 +11,7 @@ use crate::{
     priority_fee::{MicroLamportPriorityFeeEstimates, PriorityFeeTracker, PriorityLevel},
     solana::solana_rpc::decode_and_deserialize,
 };
+use cadence_macros::{statsd_count, statsd_time};
 use jsonrpsee::{
     core::{async_trait, RpcResult},
     proc_macros::rpc,
@@ -131,6 +133,7 @@ fn get_from_address_lookup_tables(
     let address_table_lookups: Option<&[solana_sdk::message::v0::MessageAddressTableLookup]> =
         transaction.message.address_table_lookups();
     if let Some(address_table_lookups) = address_table_lookups {
+        let start = Instant::now();
         let mut lookup_table_indices = HashMap::new();
         let address_table_lookup_accounts: Vec<Pubkey> = address_table_lookups
             .iter()
@@ -142,6 +145,10 @@ fn get_from_address_lookup_tables(
                 a.account_key
             })
             .collect();
+        statsd_count!(
+            "get_from_address_lookup_tables_num_accounts",
+            address_table_lookup_accounts.len() as i64
+        );
         let accounts = rpc_client.get_multiple_accounts(address_table_lookup_accounts.as_slice());
         match accounts {
             Ok(accounts) => {
@@ -185,6 +192,7 @@ fn get_from_address_lookup_tables(
                 info!("error getting accounts: {:?}", e);
             }
         }
+        statsd_time!("get_from_address_lookup_tables", start.elapsed());
     }
     account_keys
 }
@@ -279,7 +287,9 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
                 });
             }
         }
-        let recommended = options.map_or(false, |o: GetPriorityFeeEstimateOptions| o.recommended.unwrap_or(false));
+        let recommended = options.map_or(false, |o: GetPriorityFeeEstimateOptions| {
+            o.recommended.unwrap_or(false)
+        });
         let priority_fee = if recommended {
             get_recommended_fee(priority_fee_levels)
         } else {
@@ -317,7 +327,7 @@ fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool 
 
 const MIN_RECOMMENDED_PRIORITY_FEE: f64 = 10_000.0;
 
-// Safety buffer on the recommended fee to cover cases where the priority fee is increasing over each block. 
+// Safety buffer on the recommended fee to cover cases where the priority fee is increasing over each block.
 const RECOMMENDED_FEE_SAFETY_BUFFER: f64 = 0.05;
 
 pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates) -> f64 {
