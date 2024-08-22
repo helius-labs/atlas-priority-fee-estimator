@@ -1,10 +1,8 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Instant;
 use std::{collections::HashMap, time::Duration};
 
 use cadence_macros::statsd_count;
-use futures::{future::TryFutureExt, sink::SinkExt, stream::StreamExt};
+use futures::{sink::SinkExt, stream::StreamExt};
 use rand::distributions::Alphanumeric;
 use rand::Rng;
 use tokio::time::sleep;

@@ -13,12 +13,11 @@ use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use tracing::error;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
-
 use crate::grpc_consumer::GrpcConsumer;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum PriorityLevel {
     Min,       // 0th percentile
     Low,       // 25th percentile
@@ -244,7 +243,7 @@ impl PriorityFeeTracker {
         });
     }
 
-    fn push_priority_fee_for_txn(
+    pub fn push_priority_fee_for_txn(
         &self,
         slot: Slot,
         accounts: Vec<Pubkey>,
@@ -279,7 +278,7 @@ impl PriorityFeeTracker {
         &self,
         accounts: Vec<Pubkey>,
         include_vote: bool,
-        lookback_period: Option<usize>,
+        lookback_period: Option<u32>,
     ) -> MicroLamportPriorityFeeEstimates {
         let start = std::time::Instant::now();
         let mut account_fees = vec![];
@@ -403,7 +402,7 @@ mod tests {
         set_global_default(client)
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_specific_fee_estimates() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(10);
@@ -442,7 +441,7 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_with_many_slots() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(101);
@@ -482,7 +481,7 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn test_with_many_slots_broken() {
         // same test as above but with an extra slot to throw off the value
         init_metrics();
