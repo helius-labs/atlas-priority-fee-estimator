@@ -13,6 +13,7 @@ use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use tracing::error;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
+
 use crate::grpc_consumer::GrpcConsumer;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
@@ -58,7 +59,7 @@ impl Into<Percentile> for PriorityLevel {
 
 type Percentile = usize;
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
 pub struct MicroLamportPriorityFeeEstimates {
     pub min: f64,
@@ -274,6 +275,13 @@ impl PriorityFeeTracker {
         }
     }
 
+    /*
+    Algo1: given the list of accounts the algorithm will:
+     1. collect all the transactions fees over n slots
+     2. collect all the transaction fees for all the accounts specified over n slots
+     3. will calculate the percentile distributions for each of two groups
+     4. will choose the highest value from each percentile between two groups
+     */
     pub fn get_priority_fee_estimates(
         &self,
         accounts: Vec<Pubkey>,
@@ -319,6 +327,85 @@ impl PriorityFeeTracker {
         );
         micro_lamport_priority_fee_estimates
     }
+
+    /*
+    Algo2: given the list of accounts the algorithm will:
+     1. collect all the transactions fees over n slots
+     2. for each specified account collect the fees and calculate the percentiles
+     4. choose maximum values for each percentile between all transactions and each account
+     */
+    pub fn get_priority_fee_estimates2(
+        &self,
+        accounts: Vec<Pubkey>,
+        include_vote: bool,
+        lookback_period: Option<u32>,
+    ) -> MicroLamportPriorityFeeEstimates {
+        let start = std::time::Instant::now();
+        let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
+
+        let mut slots_vec = Vec::with_capacity(lookback);
+        self.slot_cache.copy_slots(&mut slots_vec);
+        slots_vec.sort();
+        slots_vec.reverse();
+
+        let mut fees = vec![];
+        let mut micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates::default();
+
+        for slot in &slots_vec[..lookback] {
+            if let Some(slot_priority_fees) = self.priority_fees.get(slot)
+            {
+                if include_vote {
+                    fees.extend_from_slice(&slot_priority_fees.fees.vote_fees);
+                }
+                fees.extend_from_slice(&slot_priority_fees.fees.non_vote_fees);
+            }
+        }
+        estimate_max_values(&mut fees, &mut micro_lamport_priority_fee_estimates);
+
+        for account in &accounts {
+            fees.clear();
+
+            for slot in &slots_vec[..lookback] {
+
+                if let Some(slot_priority_fees) = self.priority_fees.get(slot)
+                {
+                    let account_priority_fees = slot_priority_fees.account_fees.get(account);
+                    if let Some(account_priority_fees) = account_priority_fees {
+                        if include_vote {
+                            fees.extend_from_slice(&account_priority_fees.vote_fees);
+                        }
+                        fees.extend_from_slice(&account_priority_fees.non_vote_fees);
+                    }
+                }
+            }
+            estimate_max_values(&mut fees, &mut micro_lamport_priority_fee_estimates);
+        }
+
+        let end = std::time::Instant::now();
+        statsd_gauge!(
+            "get_priority_fee_estimates_time2",
+            end.duration_since(start).as_nanos() as u64
+        );
+        micro_lamport_priority_fee_estimates
+    }
+}
+
+fn estimate_max_values(
+    mut fees: &mut Vec<f64>,
+    micro_lamport_priority_fee_estimates: &mut MicroLamportPriorityFeeEstimates,
+) {
+    micro_lamport_priority_fee_estimates.min =
+        percentile(&mut fees, 0).max(micro_lamport_priority_fee_estimates.min);
+    micro_lamport_priority_fee_estimates.low =
+        percentile(&mut fees, 25).max(micro_lamport_priority_fee_estimates.low);
+    micro_lamport_priority_fee_estimates.medium =
+        percentile(&mut fees, 50).max(micro_lamport_priority_fee_estimates.medium);
+    micro_lamport_priority_fee_estimates.high =
+        percentile(&mut fees, 75).max(micro_lamport_priority_fee_estimates.high);
+    micro_lamport_priority_fee_estimates.very_high =
+        percentile(&mut fees, 95).max(micro_lamport_priority_fee_estimates.very_high);
+    micro_lamport_priority_fee_estimates.unsafe_max =
+        percentile(&mut fees, 100).max(micro_lamport_priority_fee_estimates.unsafe_max);
 }
 
 fn max(a: f64, b: f64) -> f64 {
@@ -327,6 +414,14 @@ fn max(a: f64, b: f64) -> f64 {
     } else {
         b
     }
+}
+
+fn calculate_lookback_size(pref_num_slots: &Option<u32>, max_available_slots: usize) -> usize {
+    max_available_slots.min(
+        pref_num_slots
+            .map(|v| v as usize)
+            .unwrap_or(max_available_slots),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -380,13 +475,15 @@ fn percentile(values: &mut Vec<f64>, percentile: Percentile) -> f64 {
     let n = values.len() as f64;
     let r = (percentile as f64 / 100.0) * (n - 1.0) + 1.0;
 
-    if r.fract() == 0.0 {
+    let val =
+        if r.fract() == 0.0 {
         values[r as usize - 1]
     } else {
         let ri = r.trunc() as usize - 1;
         let rf = r.fract();
         values[ri] + rf * (values[ri + 1] - values[ri])
-    }
+    };
+    val
 }
 
 #[cfg(test)]
@@ -426,6 +523,24 @@ mod tests {
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
             tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 95.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -479,6 +594,23 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+        let expected_min_fee = 1.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 95.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -516,6 +648,144 @@ mod tests {
         assert_ne!(estimates.medium, expected_medium_fee);
         assert_ne!(estimates.high, expected_high_fee);
         assert_ne!(estimates.very_high, expected_very_high_fee);
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 95.0;
+        assert_ne!(estimates.low, expected_low_fee);
+        assert_ne!(estimates.medium, expected_medium_fee);
+        assert_ne!(estimates.high, expected_high_fee);
+        assert_ne!(estimates.very_high, expected_very_high_fee);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_with_transactions_for_different_accounts() {
+        // same test as above but with an extra slot to throw off the value
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(100);
+
+        // adding set of fees at beginning that would mess up percentiles if they were not removed
+        let mut fees = vec![];
+        let mut i = 0;
+        while i < 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let account_4 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3, account_4];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for (i, fee) in fees.clone().into_iter().enumerate() {
+            let pos = i / (100 / accounts.len());
+            let account = accounts[pos];
+            tracker.push_priority_fee_for_txn(i as Slot, vec![account], fee as u64, false);
+        }
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates(vec![account_1, account_4], false, None);
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 24.75;
+        let expected_medium_fee = 49.5;
+        let expected_high_fee = 86.75;
+        let expected_very_high_fee = 96.55;
+        let expected_max_fee = 99.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![account_1, account_4], false, None);
+        let expected_min_fee = 75.0;
+        let expected_low_fee = 81.0;
+        let expected_medium_fee = 87.0;
+        let expected_high_fee = 93.0;
+        let expected_very_high_fee = 97.8;
+        let expected_max_fee = 99.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_with_multiple_transactions_for_different_slots() {
+        // same test as above but with an extra slot to throw off the value
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        // adding set of fees at beginning that would mess up percentiles if they were not removed
+        let mut fees = vec![];
+        let mut i = 0;
+        while i < 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let account_4 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3, account_4];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for (i, fee) in fees.clone().into_iter().enumerate() {
+            let pos = i % accounts.len();
+            let slot = i / 10;
+            let account = accounts[pos];
+            tracker.push_priority_fee_for_txn(slot as Slot, vec![account], fee as u64, false);
+        }
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates(vec![account_1, account_4], false, None);
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 24.75;
+        let expected_medium_fee = 49.5;
+        let expected_high_fee = 74.25;
+        let expected_very_high_fee = 94.05;
+        let expected_max_fee = 99.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![account_1, account_4], false, None);
+        let expected_min_fee = 3.0;
+        let expected_low_fee = 27.0;
+        let expected_medium_fee = 51.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 94.19999999999999;
+        let expected_max_fee = 99.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
     }
 
     #[tokio::test]
@@ -544,6 +814,24 @@ mod tests {
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
             tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 95.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates =
+            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
