@@ -88,6 +88,12 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
+
+    #[method(name = "getPriorityFeeEstimate2")]
+    fn get_priority_fee_estimate2(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+    ) -> RpcResult<GetPriorityFeeEstimateResponse>;
 }
 
 fn validate_get_priority_fee_estimate_request(
@@ -247,6 +253,50 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request,  move |
+            accounts: Vec<Pubkey>,
+            include_vote: bool,
+            lookback_period: Option<u32>| {
+             self.priority_fee_tracker.get_priority_fee_estimates(accounts, include_vote, lookback_period)
+        })
+
+    }
+
+    fn get_priority_fee_estimate2(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+    ) -> RpcResult<GetPriorityFeeEstimateResponse> {
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request,  |
+            accounts: Vec<Pubkey>,
+            include_vote: bool,
+            lookback_period: Option<u32>| {
+            self.priority_fee_tracker.get_priority_fee_estimates2(accounts, include_vote, lookback_period)
+        })
+    }
+}
+
+impl AtlasPriorityFeeEstimator {
+    pub fn new(
+        priority_fee_tracker: Arc<PriorityFeeTracker>,
+        rpc_url: String,
+        max_lookback_slots: usize,
+    ) -> Self {
+        let server = AtlasPriorityFeeEstimator {
+            priority_fee_tracker,
+            rpc_client: Some(RpcClient::new(rpc_url)),
+            max_lookback_slots,
+        };
+        server
+    }
+
+    fn execute_priority_fee_estimate_coordinator<F>(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+        algo_fn: F
+    ) -> RpcResult<GetPriorityFeeEstimateResponse>
+    where
+    F: Fn(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates
+    {
         let options = get_priority_fee_estimate_request.options.clone();
         let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
         if let Some(reason) = reason {
@@ -268,11 +318,7 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
             }
         }
         let include_vote = should_include_vote(&options);
-        let priority_fee_levels = self.priority_fee_tracker.get_priority_fee_estimates(
-            accounts,
-            include_vote,
-            lookback_slots,
-        );
+        let priority_fee_levels = algo_fn(accounts, include_vote, lookback_slots);
         if let Some(options) = options.clone() {
             if options.include_all_priority_fee_levels == Some(true) {
                 return Ok(GetPriorityFeeEstimateResponse {
@@ -304,25 +350,10 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         } else {
             priority_fee_levels.medium
         };
-        return Ok(GetPriorityFeeEstimateResponse {
+        Ok(GetPriorityFeeEstimateResponse {
             priority_fee_estimate: Some(priority_fee),
             priority_fee_levels: None,
-        });
-    }
-}
-
-impl AtlasPriorityFeeEstimator {
-    pub fn new(
-        priority_fee_tracker: Arc<PriorityFeeTracker>,
-        rpc_url: String,
-        max_lookback_slots: usize,
-    ) -> Self {
-        let server = AtlasPriorityFeeEstimator {
-            priority_fee_tracker,
-            rpc_client: Some(RpcClient::new(rpc_url)),
-            max_lookback_slots,
-        };
-        server
+        })
     }
 }
 
