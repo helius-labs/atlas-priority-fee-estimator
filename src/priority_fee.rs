@@ -1,6 +1,6 @@
-use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use std::ops::Sub;
 
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
@@ -10,7 +10,9 @@ use serde::Serialize;
 use solana_program_runtime::compute_budget::ComputeBudget;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
-use tracing::error;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::time::timeout;
+use tracing::{error, warn};
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
 
@@ -97,6 +99,7 @@ pub struct PriorityFeeTracker {
     priority_fees: Arc<PriorityFeesBySlot>,
     compute_budget: ComputeBudget,
     slot_cache: SlotCache,
+    sampling_sender: Sender<(Vec<Pubkey>, bool, Option<u32>)>
 }
 
 impl GrpcConsumer for PriorityFeeTracker {
@@ -193,55 +196,117 @@ impl GrpcConsumer for PriorityFeeTracker {
 
 impl PriorityFeeTracker {
     pub fn new(slot_cache_length: usize) -> Self {
+        let (sampling_txn, sampling_rxn) = channel::<(Vec<Pubkey>, bool, Option<u32>)>(1_000);
+
         let tracker = Self {
             priority_fees: Arc::new(DashMap::new()),
             slot_cache: SlotCache::new(slot_cache_length),
             compute_budget: ComputeBudget::default(),
+            sampling_sender: sampling_txn,
         };
-        tracker.poll_fees();
+        tracker.poll_fees(sampling_rxn);
         tracker
     }
 
-    fn poll_fees(&self) {
+    fn poll_fees(&self, mut sampling_rxn: Receiver<(Vec<Pubkey>, bool, Option<u32>)>) {
         let priority_fee_tracker = self.clone();
         tokio::spawn(async move {
+            let mut start = Instant::now();
             loop {
-                let global_fees =
-                    priority_fee_tracker.get_priority_fee_estimates(vec![], false, None);
-                statsd_gauge!(
-                    "min_priority_fee",
-                    global_fees.min as u64,
-                    "account" => "none"
-                );
-                statsd_gauge!("low_priority_fee", global_fees.low as u64, "account" => "none");
-                statsd_gauge!(
-                    "medium_priority_fee",
-                    global_fees.medium as u64,
-                    "account" => "none"
-                );
-                statsd_gauge!(
-                    "high_priority_fee",
-                    global_fees.high as u64,
-                    "account" => "none"
-                );
-                statsd_gauge!(
-                    "very_high_priority_fee",
-                    global_fees.very_high as u64,
-                    "account" => "none"
-                );
-                statsd_gauge!(
-                    "unsafe_max_priority_fee",
-                    global_fees.unsafe_max as u64,
-                    "account" => "none"
-                );
-                statsd_gauge!(
-                    "recommended_priority_fee",
-                    get_recommended_fee(global_fees) as u64,
-                    "account" => "none"
-                );
-                tokio::time::sleep(Duration::from_millis(1000)).await
+                let elapsed = start.elapsed().as_millis();
+                let remaining_time = 1_000u128.saturating_sub(elapsed);
+                match timeout(Duration::from_millis(remaining_time as u64), sampling_rxn.recv()).await
+                {
+                    Ok(res) => {
+                        match res {
+                            Some((accounts, include_vote, lookback_period)) =>
+                                priority_fee_tracker.record_specific_fees(accounts, include_vote, lookback_period),
+                            _ => {},
+                        }
+                    }
+                    Err(_) => {
+                        priority_fee_tracker.record_general_fees();
+                        start = Instant::now();
+                    },
+                };
             }
         });
+    }
+
+    fn record_general_fees(&self) {
+        let global_fees = self.calculation1(&vec![], false, &None);
+        statsd_gauge!(
+            "min_priority_fee",
+            global_fees.min as u64,
+            "account" => "none"
+        );
+        statsd_gauge!("low_priority_fee", global_fees.low as u64, "account" => "none");
+        statsd_gauge!(
+            "medium_priority_fee",
+            global_fees.medium as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "high_priority_fee",
+            global_fees.high as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "very_high_priority_fee",
+            global_fees.very_high as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "unsafe_max_priority_fee",
+            global_fees.unsafe_max as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "recommended_priority_fee",
+            get_recommended_fee(global_fees) as u64,
+            "account" => "none"
+        );
+    }
+
+    fn record_specific_fees(&self, accounts: Vec<Pubkey>, include_vote: bool, lookback_period: Option<u32>)
+    {
+        let global_fees1 = self.calculation1(&accounts, include_vote, &lookback_period);
+        let global_fees2 = self.calculation2(&accounts, include_vote, &lookback_period);
+
+        statsd_gauge!(
+            "min_priority_fee_diff",
+            global_fees1.min.sub(global_fees2.min),
+            "account" => "none"
+        );
+        statsd_gauge!("low_priority_fee_diff",
+            global_fees1.low.sub(global_fees2.low) as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "medium_priority_fee_diff",
+            global_fees1.medium.sub(global_fees2.medium) as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "high_priority_fee_diff",
+            global_fees1.high.sub(global_fees2.high) as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "very_high_priority_fee_diff",
+            global_fees1.very_high.sub(global_fees2.very_high) as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "unsafe_max_priority_fee_diff",
+            global_fees1.unsafe_max.sub(global_fees2.unsafe_max) as u64,
+            "account" => "none"
+        );
+        statsd_gauge!(
+            "recommended_priority_fee_diff",
+            get_recommended_fee(global_fees1).sub(get_recommended_fee(global_fees2)) as u64,
+            "account" => "none"
+        );
     }
 
     pub fn push_priority_fee_for_txn(
@@ -275,6 +340,38 @@ impl PriorityFeeTracker {
         }
     }
 
+
+
+    // TODO: DKH - both algos should probably be in some enum (like algo1, algo2) and be passed to
+    // this method instead of sending a bool flag. I'll refactor this in next iteration. already too many changes
+    pub fn get_priority_fee_estimates(
+        &self,
+        accounts: Vec<Pubkey>,
+        include_vote: bool,
+        lookback_period: Option<u32>,
+        calculation1: bool
+    ) -> MicroLamportPriorityFeeEstimates {
+        let start = Instant::now();
+        let micro_lamport_priority_fee_estimates = if calculation1
+        {
+            self.calculation1(&accounts, include_vote, &lookback_period)
+        }
+        else {
+            self.calculation2(&accounts, include_vote, &lookback_period)
+        };
+
+        statsd_gauge!(
+            "get_priority_fee_estimates_time",
+            start.elapsed().as_nanos() as u64
+        );
+        if let Err(e) = self.sampling_sender.try_send((accounts.to_owned(), include_vote, lookback_period.to_owned()))
+        {
+            warn!("Did not add sample for calculation {e}");
+        }
+
+        micro_lamport_priority_fee_estimates
+    }
+
     /*
     Algo1: given the list of accounts the algorithm will:
      1. collect all the transactions fees over n slots
@@ -282,19 +379,12 @@ impl PriorityFeeTracker {
      3. will calculate the percentile distributions for each of two groups
      4. will choose the highest value from each percentile between two groups
      */
-    pub fn get_priority_fee_estimates(
-        &self,
-        accounts: Vec<Pubkey>,
-        include_vote: bool,
-        lookback_period: Option<u32>,
-    ) -> MicroLamportPriorityFeeEstimates {
-        let start = std::time::Instant::now();
+    fn calculation1(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
         let mut account_fees = vec![];
         let mut transaction_fees = vec![];
-        let rc_accounts = Rc::new(accounts);
         for (i, slot_priority_fees) in self.priority_fees.iter().enumerate() {
             if let Some(lookback_period) = lookback_period {
-                if i >= lookback_period as usize {
+                if i >= *lookback_period as usize {
                     break;
                 }
             }
@@ -302,7 +392,7 @@ impl PriorityFeeTracker {
                 transaction_fees.extend_from_slice(&slot_priority_fees.fees.vote_fees);
             }
             transaction_fees.extend_from_slice(&slot_priority_fees.fees.non_vote_fees);
-            for account in rc_accounts.iter() {
+            for account in accounts {
                 let account_priority_fees = slot_priority_fees.account_fees.get(account);
                 if let Some(account_priority_fees) = account_priority_fees {
                     if include_vote {
@@ -320,27 +410,16 @@ impl PriorityFeeTracker {
             very_high: max_percentile(&mut account_fees, &mut transaction_fees, 95),
             unsafe_max: max_percentile(&mut account_fees, &mut transaction_fees, 100),
         };
-        let end = std::time::Instant::now();
-        statsd_gauge!(
-            "get_priority_fee_estimates_time",
-            end.duration_since(start).as_nanos() as u64
-        );
         micro_lamport_priority_fee_estimates
     }
 
     /*
-    Algo2: given the list of accounts the algorithm will:
-     1. collect all the transactions fees over n slots
-     2. for each specified account collect the fees and calculate the percentiles
-     4. choose maximum values for each percentile between all transactions and each account
-     */
-    pub fn get_priority_fee_estimates2(
-        &self,
-        accounts: Vec<Pubkey>,
-        include_vote: bool,
-        lookback_period: Option<u32>,
-    ) -> MicroLamportPriorityFeeEstimates {
-        let start = std::time::Instant::now();
+        Algo2: given the list of accounts the algorithm will:
+         1. collect all the transactions fees over n slots
+         2. for each specified account collect the fees and calculate the percentiles
+         4. choose maximum values for each percentile between all transactions and each account
+         */
+    fn calculation2(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
         let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
 
         let mut slots_vec = Vec::with_capacity(lookback);
@@ -362,7 +441,7 @@ impl PriorityFeeTracker {
         }
         estimate_max_values(&mut fees, &mut micro_lamport_priority_fee_estimates);
 
-        for account in &accounts {
+        for account in accounts {
             fees.clear();
 
             for slot in &slots_vec[..lookback] {
@@ -380,12 +459,6 @@ impl PriorityFeeTracker {
             }
             estimate_max_values(&mut fees, &mut micro_lamport_priority_fee_estimates);
         }
-
-        let end = std::time::Instant::now();
-        statsd_gauge!(
-            "get_priority_fee_estimates_time2",
-            end.duration_since(start).as_nanos() as u64
-        );
         micro_lamport_priority_fee_estimates
     }
 }
@@ -522,7 +595,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -540,7 +613,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -581,7 +654,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_min_fee = 1.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
@@ -598,7 +671,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_min_fee = 1.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
@@ -639,7 +712,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
@@ -652,7 +725,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
@@ -676,20 +749,39 @@ mod tests {
         let account_4 = Pubkey::new_unique();
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
-        for val in 0..100
-        {
+        for val in 0..100 {
             match val {
-                0..=24 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_1], val as u64, false),
-                25..=49 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_2], val as u64, false),
-                50..=74 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_3], val as u64, false),
-                75..=99 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_4], val as u64, false),
-                _ => {},
+                0..=24 => tracker.push_priority_fee_for_txn(
+                    val as Slot,
+                    vec![account_1],
+                    val as u64,
+                    false,
+                ),
+                25..=49 => tracker.push_priority_fee_for_txn(
+                    val as Slot,
+                    vec![account_2],
+                    val as u64,
+                    false,
+                ),
+                50..=74 => tracker.push_priority_fee_for_txn(
+                    val as Slot,
+                    vec![account_3],
+                    val as u64,
+                    false,
+                ),
+                75..=99 => tracker.push_priority_fee_for_txn(
+                    val as Slot,
+                    vec![account_4],
+                    val as u64,
+                    false,
+                ),
+                _ => {}
             }
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![account_1, account_4], false, None);
+            tracker.calculation1(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 0.0;
         let expected_low_fee = 24.75;
         let expected_medium_fee = 49.5;
@@ -707,7 +799,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![account_1, account_4], false, None);
+            tracker.calculation2(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 75.0;
         let expected_low_fee = 81.0;
         let expected_medium_fee = 87.0;
@@ -735,23 +827,42 @@ mod tests {
         let account_4 = Pubkey::new_unique();
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
-        for val in 0..100
-        {
+        for val in 0..100 {
             let slot = val / 10; // divide between 10 slots to have more than 1 transaction per slot
-            // also evenly distribute the orders
+                                 // also evenly distribute the orders
             match val {
-                val if 0 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_1], val as u64, false),
-                val if 1 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_2], val as u64, false),
-                val if 2 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_3], val as u64, false),
-                val if 3 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_4], val as u64, false),
-                _ => {},
+                val if 0 == val % 4 => tracker.push_priority_fee_for_txn(
+                    slot as Slot,
+                    vec![account_1],
+                    val as u64,
+                    false,
+                ),
+                val if 1 == val % 4 => tracker.push_priority_fee_for_txn(
+                    slot as Slot,
+                    vec![account_2],
+                    val as u64,
+                    false,
+                ),
+                val if 2 == val % 4 => tracker.push_priority_fee_for_txn(
+                    slot as Slot,
+                    vec![account_3],
+                    val as u64,
+                    false,
+                ),
+                val if 3 == val % 4 => tracker.push_priority_fee_for_txn(
+                    slot as Slot,
+                    vec![account_4],
+                    val as u64,
+                    false,
+                ),
+                _ => {}
             }
         }
 
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![account_1, account_4], false, None);
+            tracker.calculation1(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 0.0;
         let expected_low_fee = 24.75;
         let expected_medium_fee = 49.5;
@@ -769,7 +880,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![account_1, account_4], false, None);
+            tracker.calculation2(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 3.0;
         let expected_low_fee = 27.0;
         let expected_medium_fee = 51.0;
@@ -809,7 +920,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -827,7 +938,7 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
-            tracker.get_priority_fee_estimates2(vec![accounts.get(0).unwrap().clone()], false, None);
+            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;

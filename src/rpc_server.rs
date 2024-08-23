@@ -89,8 +89,8 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
 
-    #[method(name = "getPriorityFeeEstimate2")]
-    fn get_priority_fee_estimate2(
+    #[method(name = "getTestPriorityFeeEstimate")]
+    fn get_test_priority_fee_estimate(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
@@ -253,9 +253,7 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.execute_priority_fee_estimate_coordinator(
-            get_priority_fee_estimate_request,
-            |accounts: Vec<Pubkey>,
+        let algo = |accounts: Vec<Pubkey>,
              include_vote: bool,
              lookback_period: Option<u32>|
              -> MicroLamportPriorityFeeEstimates {
@@ -263,28 +261,28 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
                     accounts,
                     include_vote,
                     lookback_period,
+                    true
                 )
-            },
-        )
+            };
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo)
     }
 
-    fn get_priority_fee_estimate2(
+    fn get_test_priority_fee_estimate(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.execute_priority_fee_estimate_coordinator(
-            get_priority_fee_estimate_request,
-            |accounts: Vec<Pubkey>,
-             include_vote: bool,
-             lookback_period: Option<u32>|
-             -> MicroLamportPriorityFeeEstimates {
-                self.priority_fee_tracker.get_priority_fee_estimates2(
-                    accounts,
-                    include_vote,
-                    lookback_period,
-                )
-            },
-        )
+        let algo = |accounts: Vec<Pubkey>,
+                    include_vote: bool,
+                    lookback_period: Option<u32>|
+                    -> MicroLamportPriorityFeeEstimates {
+            self.priority_fee_tracker.get_priority_fee_estimates(
+                accounts,
+                include_vote,
+                lookback_period,
+                false
+            )
+        };
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo)
     }
 }
 
