@@ -253,25 +253,38 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request,  move |
-            accounts: Vec<Pubkey>,
-            include_vote: bool,
-            lookback_period: Option<u32>| {
-             self.priority_fee_tracker.get_priority_fee_estimates(accounts, include_vote, lookback_period)
-        })
-
+        self.execute_priority_fee_estimate_coordinator(
+            get_priority_fee_estimate_request,
+            |accounts: Vec<Pubkey>,
+             include_vote: bool,
+             lookback_period: Option<u32>|
+             -> MicroLamportPriorityFeeEstimates {
+                self.priority_fee_tracker.get_priority_fee_estimates(
+                    accounts,
+                    include_vote,
+                    lookback_period,
+                )
+            },
+        )
     }
 
     fn get_priority_fee_estimate2(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request,  |
-            accounts: Vec<Pubkey>,
-            include_vote: bool,
-            lookback_period: Option<u32>| {
-            self.priority_fee_tracker.get_priority_fee_estimates2(accounts, include_vote, lookback_period)
-        })
+        self.execute_priority_fee_estimate_coordinator(
+            get_priority_fee_estimate_request,
+            |accounts: Vec<Pubkey>,
+             include_vote: bool,
+             lookback_period: Option<u32>|
+             -> MicroLamportPriorityFeeEstimates {
+                self.priority_fee_tracker.get_priority_fee_estimates2(
+                    accounts,
+                    include_vote,
+                    lookback_period,
+                )
+            },
+        )
     }
 }
 
@@ -292,10 +305,10 @@ impl AtlasPriorityFeeEstimator {
     fn execute_priority_fee_estimate_coordinator<F>(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-        algo_fn: F
+        algo_fn: F,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>
     where
-    F: Fn(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates
+        F: Fn(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates,
     {
         let options = get_priority_fee_estimate_request.options.clone();
         let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);

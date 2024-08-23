@@ -670,24 +670,21 @@ mod tests {
         let tracker = PriorityFeeTracker::new(100);
 
         // adding set of fees at beginning that would mess up percentiles if they were not removed
-        let mut fees = vec![];
-        let mut i = 0;
-        while i < 100 {
-            fees.push(i as f64);
-            i += 1;
-        }
-
         let account_1 = Pubkey::new_unique();
         let account_2 = Pubkey::new_unique();
         let account_3 = Pubkey::new_unique();
         let account_4 = Pubkey::new_unique();
-        let accounts = vec![account_1, account_2, account_3, account_4];
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
-        for (i, fee) in fees.clone().into_iter().enumerate() {
-            let pos = i / (100 / accounts.len());
-            let account = accounts[pos];
-            tracker.push_priority_fee_for_txn(i as Slot, vec![account], fee as u64, false);
+        for val in 0..100
+        {
+            match val {
+                0..=24 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_1], val as u64, false),
+                25..=49 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_2], val as u64, false),
+                50..=74 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_3], val as u64, false),
+                75..=99 => tracker.push_priority_fee_for_txn(val as Slot, vec![account_4], val as u64, false),
+                _ => {},
+            }
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -732,26 +729,25 @@ mod tests {
         let tracker = PriorityFeeTracker::new(10);
 
         // adding set of fees at beginning that would mess up percentiles if they were not removed
-        let mut fees = vec![];
-        let mut i = 0;
-        while i < 100 {
-            fees.push(i as f64);
-            i += 1;
-        }
-
         let account_1 = Pubkey::new_unique();
         let account_2 = Pubkey::new_unique();
         let account_3 = Pubkey::new_unique();
         let account_4 = Pubkey::new_unique();
-        let accounts = vec![account_1, account_2, account_3, account_4];
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
-        for (i, fee) in fees.clone().into_iter().enumerate() {
-            let pos = i % accounts.len();
-            let slot = i / 10;
-            let account = accounts[pos];
-            tracker.push_priority_fee_for_txn(slot as Slot, vec![account], fee as u64, false);
+        for val in 0..100
+        {
+            let slot = val / 10; // divide between 10 slots to have more than 1 transaction per slot
+            // also evenly distribute the orders
+            match val {
+                val if 0 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_1], val as u64, false),
+                val if 1 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_2], val as u64, false),
+                val if 2 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_3], val as u64, false),
+                val if 3 == val % 4 => tracker.push_priority_fee_for_txn(slot as Slot, vec![account_4], val as u64, false),
+                _ => {},
+            }
         }
+
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates =
