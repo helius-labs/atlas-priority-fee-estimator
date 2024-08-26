@@ -253,36 +253,36 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        let algo = |accounts: Vec<Pubkey>,
-             include_vote: bool,
-             lookback_period: Option<u32>|
-             -> MicroLamportPriorityFeeEstimates {
-                self.priority_fee_tracker.get_priority_fee_estimates(
-                    accounts,
-                    include_vote,
-                    lookback_period,
-                    true
-                )
-            };
-        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo)
+        let algo_run_fn = |accounts: Vec<Pubkey>,
+                           include_vote: bool,
+                           lookback_period: Option<u32>|
+                           -> MicroLamportPriorityFeeEstimates {
+            self.priority_fee_tracker.get_priority_fee_estimates(
+                accounts,
+                include_vote,
+                lookback_period,
+                true,
+            )
+        };
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo_run_fn)
     }
 
     fn get_test_priority_fee_estimate(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        let algo = |accounts: Vec<Pubkey>,
-                    include_vote: bool,
-                    lookback_period: Option<u32>|
-                    -> MicroLamportPriorityFeeEstimates {
+        let algo_run_fn = |accounts: Vec<Pubkey>,
+                           include_vote: bool,
+                           lookback_period: Option<u32>|
+                           -> MicroLamportPriorityFeeEstimates {
             self.priority_fee_tracker.get_priority_fee_estimates(
                 accounts,
                 include_vote,
                 lookback_period,
-                false
+                false,
             )
         };
-        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo)
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo_run_fn)
     }
 }
 
@@ -300,13 +300,11 @@ impl AtlasPriorityFeeEstimator {
         server
     }
 
-    fn execute_priority_fee_estimate_coordinator<F>(
+    fn execute_priority_fee_estimate_coordinator(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-        algo_fn: F,
+        priority_fee_calc_fn: impl FnOnce(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>
-    where
-        F: Fn(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates,
     {
         let options = get_priority_fee_estimate_request.options.clone();
         let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
@@ -329,7 +327,7 @@ impl AtlasPriorityFeeEstimator {
             }
         }
         let include_vote = should_include_vote(&options);
-        let priority_fee_levels = algo_fn(accounts, include_vote, lookback_slots);
+        let priority_fee_levels = priority_fee_calc_fn(accounts, include_vote, lookback_slots);
         if let Some(options) = options.clone() {
             if options.include_all_priority_fee_levels == Some(true) {
                 return Ok(GetPriorityFeeEstimateResponse {
@@ -407,7 +405,7 @@ mod tests {
     use solana_sdk::pubkey::Pubkey;
     use std::sync::Arc;
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_calculating_fees_with_all_options_none() {
         prep_statsd();
 
@@ -432,7 +430,7 @@ mod tests {
         assert!(resp.priority_fee_levels.is_none());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_calculating_fees_with_no_options() {
         prep_statsd();
 
@@ -456,7 +454,7 @@ mod tests {
         assert!(resp.priority_fee_levels.is_none());
     }
 
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_calculating_all_fees() {
         prep_statsd();
 
@@ -490,7 +488,7 @@ mod tests {
         assert_eq!(levels.unsafe_max, 200.0);
         assert!(resp.priority_fee_estimate.is_none());
     }
-    #[tokio::test(flavor = "current_thread")]
+    #[tokio::test]
     async fn test_calculating_recommended_given_very_low_calculated_fee() {
         prep_statsd();
 
