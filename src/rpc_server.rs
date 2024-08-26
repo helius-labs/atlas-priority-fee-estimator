@@ -44,8 +44,8 @@ impl fmt::Debug for AtlasPriorityFeeEstimator {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "camelCase"),
-    deny_unknown_fields
 )]
+// TODO: DKH - add deny_unknown_fields
 pub struct GetPriorityFeeEstimateRequest {
     pub transaction: Option<String>,       // estimate fee for a txn
     pub account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
@@ -55,8 +55,8 @@ pub struct GetPriorityFeeEstimateRequest {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "camelCase"),
-    deny_unknown_fields
 )]
+// TODO: DKH - add deny_unknown_fields
 pub struct GetPriorityFeeEstimateOptions {
     // controls input txn encoding
     pub transaction_encoding: Option<UiTransactionEncoding>,
@@ -399,7 +399,6 @@ mod tests {
     use cadence::{NopMetricSink, StatsdClient};
     use jsonrpsee::core::Cow;
     use jsonrpsee::core::__reexports::serde_json;
-    use jsonrpsee::core::__reexports::serde_json::value::RawValue;
     use jsonrpsee::types::{Id, Request, TwoPointZero};
     use solana_sdk::clock::Slot;
     use solana_sdk::pubkey::Pubkey;
@@ -517,18 +516,21 @@ mod tests {
         assert_eq!(resp.priority_fee_estimate, Some(10500.0));
     }
 
-    #[test]
+    // #[test]
+    // TODO: DKH - add the test back after we readd the validation
     fn test_parsing_wrong_fields() {
         for (param, error) in bad_params() {
-            let json_val = format!("{{\"jsonrpc\": \"2.0\",\"id\": \"1\", \"method\": \"getPriorityFeeEstimate\", \"params\": {param} }}");
-            let res = serde_json::from_str::<jsonrpsee::types::Request>(json_val.as_str());
+            let json_val = format!("{{\"jsonrpc\": \"2.0\",\"id\": \"1\", \"method\": \"getPriorityFeeEstimate\", \"params\": [{param}] }}");
+            let res = serde_json::from_str::<Request>(json_val.as_str());
             let res = res.unwrap();
             assert_request(&res, Id::Str(Cow::const_str("1")), "getPriorityFeeEstimate");
 
-            let params: serde_json::error::Result<GetPriorityFeeEstimateRequest> =
-                serde_json::from_str(res.params.map(RawValue::get).unwrap());
-            assert!(params.is_err());
-            assert_eq!(params.err().unwrap().to_string(), error, "testing {param}");
+            if let Some(val) = res.params
+            {
+                let params: Result<Vec<GetPriorityFeeEstimateRequest>, _> = serde_json::from_str(val.get());
+                assert!(params.is_err());
+                assert_eq!(params.err().unwrap().to_string(), error, "testing {param}");
+            }
         }
     }
 
