@@ -17,7 +17,7 @@ cadence = "0.29.0"
 cadence-macros = "0.29.0"
 dashmap = "5.5.3"
 queues = "1.1.0"
-jsonrpsee = { version = "0.20.1", features = [
+jsonrpsee = { version = "0.22.5", features = [
     "server",
     "http-client",
     "macros",

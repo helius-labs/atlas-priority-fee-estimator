@@ -5,11 +5,13 @@ use cadence::{BufferedUdpMetricSink, QueuingMetricSink, StatsdClient};
 use cadence_macros::set_global_default;
 use figment::{providers::Env, Figment};
 use grpc_geyser::GrpcGeyserImpl;
-use jsonrpsee::server::{middleware::ProxyGetRequestLayer, ServerBuilder};
+use jsonrpsee::server::{RpcServiceBuilder, ServerBuilder};
+use jsonrpsee::server::middleware::http::ProxyGetRequestLayer;
 use priority_fee::PriorityFeeTracker;
 use rpc_server::AtlasPriorityFeeEstimator;
 use serde::Deserialize;
 use tracing::{error, info};
+
 mod errors;
 mod grpc_consumer;
 mod grpc_geyser;
@@ -17,6 +19,7 @@ mod priority_fee;
 mod rpc_server;
 mod slot_cache;
 mod solana;
+mod temp_validator;
 
 #[derive(Debug, Deserialize, Clone)]
 struct EstimatorEnv {
@@ -50,7 +53,8 @@ async fn main() {
 
     let port = env.port.unwrap_or(4141);
     let server = ServerBuilder::default()
-        .set_middleware(
+        .set_rpc_middleware(RpcServiceBuilder::new().layer(temp_validator::RpcValidatorLayer::new()))
+        .set_http_middleware(
             tower::ServiceBuilder::new()
                 // Proxy `GET /health` requests to internal `health` method.
                 .layer(

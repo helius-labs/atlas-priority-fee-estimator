@@ -1,2 +1,72 @@
-.vscode/
-target/
+# Javascript/Typescript
+node_modules/
+dist/
+build/
+coverage/
+vendor/
+
+# Node Logs
+logs
+*.log
+npm-debug.log*
+AWSCLIV2.pkg
+
+# Mac
+**/.DS_Store
+
+# IDEs
+**/.vscode
+**/.idea/
+
+# Services
+ts-services/parser-lambda/parser/test/data/local/*
+ts-services/parser-lambda/parser/test/output/*
+ts-services/parser-lambda/parser/playground.ts
+
+# Secrets
+ts-services/dev-api-lambda/crypto-billing/*_secrets.ts
+infra/ansible/vars/**/*-secrets.yaml
+infra/ansible/vars/**/*-secrets.yml
+infra/ansible/photon/vars/*-secrets.yaml
+infra/ansible/photon/vars/*-secrets.yml
+infra/ansible/rpc/templates/bt-creds*.json
+
+# Rust
+**/target/
+
+# CPU profiles
+*.cpuprofile
+
+# Built helm charts
+infra/**/*.tgz
+
+.gradle
+.m2
+bin
+
+# Build output directies
+/target
+*/target
+/build
+*/build
+
+# Local Redis
+dump.rdb
+
+infra/ansible/roles/Datadog.datadog
+infra/ansible/photon/roles/datadog.datadog
+
+
+scripts/data
+
+# Jupyter notebooks
+*.ipynb
+
+# Personal Playground
+personal_playground
+
+
+# Used for local deployments of RPC operator
+/rpc-operator/
+**/systest/*.json
+**/router-benchmarks/*.json

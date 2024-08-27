@@ -1,0 +1,54 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      fee-estimator: ${{ steps.filter.outputs.fee-estimator}}
+    steps:
+      - uses: actions/checkout@v3
+      - uses: dorny/paths-filter@v2.2.1
+        id: filter
+        with:
+          filters: |
+            fee-estimator:
+            - '*/**'
+
+  fee-estimator-tests:
+      needs: changes
+      if: ${{ needs.changes.outputs.fee-estimator == 'true' }}
+      runs-on: ubuntu-latest
+      env:
+          RUST_TOOLCHAIN: stable
+          CARGO_INCREMENTAL: 0
+          SCCACHE_GHA_ENABLED: 'true'
+          RUSTC_WRAPPER: 'sccache'
+          ENV: 'test'
+      steps:
+          - uses: actions/checkout@v4
+          - name: Cleanup Apt
+            run: sudo find /var/lib/apt/lists/ -type 'f' -name 'archive*' -delete && sudo apt-get update
+          - uses: rui314/setup-mold@v1
+            with:
+                mold-version: 1.1.1
+                make-default: true
+          - name: Ensure we use Mold
+            run: sudo ln -s /usr/local/bin/ld.mold /usr/bin/ld.lld
+          - name: Install rust + caching
+            uses: actions-rust-lang/setup-rust-toolchain@v1
+            with:
+                rustflags: '-C link-arg=-fuse-ld=lld'
+                components: rustfmt, clippy
+          - name: Set up sccache
+            uses: mozilla-actions/sccache-action@v0.0.3
+          - name: Clear sccache stats
+            run: sccache --zero-stats
+          - name: Run Tests
+            run: |
+                cargo test -- --nocapture
+
