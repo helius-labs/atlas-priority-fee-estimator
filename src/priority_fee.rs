@@ -9,7 +9,7 @@ use solana_program_runtime::compute_budget::ComputeBudget;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tracing::{error, warn};
+use tracing::{debug, error};
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::SubscribeUpdate;
 
@@ -439,9 +439,10 @@ impl PriorityFeeTracker {
             "get_priority_fee_estimates_time",
             start.elapsed().as_nanos() as u64
         );
-        if let Err(e) = self.sampling_sender.try_send((accounts.to_owned(), include_vote, lookback_period.to_owned()))
+        if let Err(e) = self.sampling_sender
+            .try_send((accounts.to_owned(), include_vote, lookback_period.to_owned()))
         {
-            warn!("Did not add sample for calculation {e}");
+            debug!("Did not add sample for calculation, {:?}", e);
         }
 
         micro_lamport_priority_fee_estimates
@@ -495,12 +496,13 @@ impl PriorityFeeTracker {
          4. choose maximum values for each percentile between all transactions and each account
          */
     fn calculation2(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
-        let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
 
         let mut slots_vec = Vec::with_capacity(self.slot_cache.len());
         self.slot_cache.copy_slots(&mut slots_vec);
         slots_vec.sort();
         slots_vec.reverse();
+
+        let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
 
         let mut fees = vec![];
         let mut micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates::default();
