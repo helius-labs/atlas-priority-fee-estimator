@@ -5,7 +5,7 @@ use jsonrpsee::server::middleware::rpc::RpcServiceT;
 use jsonrpsee::types::Request;
 use serde::{Deserialize, Serialize};
 use solana_transaction_status::UiTransactionEncoding;
-use tracing::debug;
+use tracing::info;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(
@@ -71,7 +71,7 @@ where
         if let Some(params) = &req.params {
             if let Err(err_val) = serde_json::from_str::<Vec<GetPriorityFeeEstimateRequestFake>>(params.get()) {
                 statsd_count!("rpc_payload_parse_failed", 1);
-                debug!("RPC parse error: {}, {}", err_val, params);
+                info!("RPC parse error: {}, {}", err_val, params);
             }
         }
 
