@@ -1,6 +1,5 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::ops::Sub;
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
 use dashmap::DashMap;
@@ -273,40 +272,115 @@ impl PriorityFeeTracker {
     {
         let old_fee = self.calculation1(&accounts, include_vote, &lookback_period);
         let new_fee = self.calculation2(&accounts, include_vote, &lookback_period);
+        let new_fee_last = self.calculation2(&accounts, include_vote, &Some(1));
 
         statsd_gauge!(
-            "min_priority_fee_diff",
-            new_fee.min.sub(old_fee.min),
-            "account" => "none"
-        );
-        statsd_gauge!("low_priority_fee_diff",
-            new_fee.low.sub(old_fee.low) as u64,
-            "account" => "none"
+            "min_priority_fee",
+            old_fee.min,
+            "account" => "spec"
         );
         statsd_gauge!(
-            "medium_priority_fee_diff",
-            new_fee.medium.sub(old_fee.medium) as u64,
-            "account" => "none"
+            "min_priority_fee_new",
+            new_fee.min,
+            "account" => "spec"
         );
         statsd_gauge!(
-            "high_priority_fee_diff",
-            new_fee.high.sub(old_fee.high) as u64,
-            "account" => "none"
+            "min_priority_fee_last",
+            new_fee_last.min,
+            "account" => "spec"
+        );
+
+        statsd_gauge!("low_priority_fee",
+            old_fee.low,
+            "account" => "spec"
+        );
+        statsd_gauge!("low_priority_fee_new",
+            new_fee.low,
+            "account" => "spec"
+        );
+        statsd_gauge!("low_priority_fee_last",
+            new_fee_last.low,
+            "account" => "spec"
+        );
+
+        statsd_gauge!(
+            "medium_priority_fee",
+            old_fee.medium,
+            "account" => "spec"
         );
         statsd_gauge!(
-            "very_high_priority_fee_diff",
-            new_fee.very_high.sub(old_fee.very_high) as u64,
-            "account" => "none"
+            "medium_priority_fee_new",
+            new_fee.medium,
+            "account" => "spec"
         );
         statsd_gauge!(
-            "unsafe_max_priority_fee_diff",
-            new_fee.unsafe_max.sub(old_fee.unsafe_max) as u64,
-            "account" => "none"
+            "medium_priority_fee_last",
+            new_fee_last.medium,
+            "account" => "spec"
+        );
+
+        statsd_gauge!(
+            "high_priority_fee",
+            old_fee.high,
+            "account" => "spec"
         );
         statsd_gauge!(
-            "recommended_priority_fee_diff",
-            get_recommended_fee(new_fee).sub(get_recommended_fee(old_fee)) as u64,
-            "account" => "none"
+            "high_priority_fee_new",
+            new_fee.high,
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "high_priority_fee_last",
+            new_fee_last.high,
+            "account" => "spec"
+        );
+
+        statsd_gauge!(
+            "very_high_priority_fee",
+            old_fee.very_high,
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "very_high_priority_fee_new",
+            new_fee.very_high,
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "very_high_priority_fee_last",
+            new_fee_last.very_high,
+            "account" => "spec"
+        );
+
+        statsd_gauge!(
+            "unsafe_max_priority_fee",
+            old_fee.unsafe_max,
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "unsafe_max_priority_fee_new",
+            new_fee.unsafe_max,
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "very_high_priority_fee_last",
+            new_fee_last.unsafe_max,
+            "account" => "spec"
+        );
+
+        statsd_gauge!(
+            "recommended_priority_fee",
+            get_recommended_fee(old_fee),
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "recommended_priority_fee_new",
+            get_recommended_fee(new_fee),
+            "account" => "spec"
+        );
+        statsd_gauge!(
+            "recommended_priority_fee_last",
+            get_recommended_fee(new_fee_last),
+            "account" => "spec"
         );
     }
 
@@ -423,7 +497,7 @@ impl PriorityFeeTracker {
     fn calculation2(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
         let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
 
-        let mut slots_vec = Vec::with_capacity(lookback);
+        let mut slots_vec = Vec::with_capacity(self.slot_cache.len());
         self.slot_cache.copy_slots(&mut slots_vec);
         slots_vec.sort();
         slots_vec.reverse();
@@ -468,22 +542,15 @@ impl PriorityFeeTracker {
 
 fn estimate_max_values(
     mut fees: &mut Vec<f64>,
-    micro_lamport_priority_fee_estimates: MicroLamportPriorityFeeEstimates,
+    mut estimates: MicroLamportPriorityFeeEstimates,
 ) -> MicroLamportPriorityFeeEstimates {
-    let mut estimate = MicroLamportPriorityFeeEstimates::default();
-    estimate.min =
-        percentile(&mut fees, 0).max(micro_lamport_priority_fee_estimates.min);
-    estimate.low =
-        percentile(&mut fees, 25).max(micro_lamport_priority_fee_estimates.low);
-    estimate.medium =
-        percentile(&mut fees, 50).max(micro_lamport_priority_fee_estimates.medium);
-    estimate.high =
-        percentile(&mut fees, 75).max(micro_lamport_priority_fee_estimates.high);
-    estimate.very_high =
-        percentile(&mut fees, 95).max(micro_lamport_priority_fee_estimates.very_high);
-    estimate.unsafe_max =
-        percentile(&mut fees, 100).max(micro_lamport_priority_fee_estimates.unsafe_max);
-    estimate
+    estimates.min = percentile(&mut fees, 0).max(estimates.min);
+    estimates.low = percentile(&mut fees, 25).max(estimates.low);
+    estimates.medium = percentile(&mut fees, 50).max(estimates.medium);
+    estimates.high = percentile(&mut fees, 75).max(estimates.high);
+    estimates.very_high = percentile(&mut fees, 95).max(estimates.very_high);
+    estimates.unsafe_max = percentile(&mut fees, 100).max(estimates.unsafe_max);
+    estimates
 }
 
 fn max(a: f64, b: f64) -> f64 {
