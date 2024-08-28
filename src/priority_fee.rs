@@ -193,7 +193,7 @@ impl GrpcConsumer for PriorityFeeTracker {
 
 impl PriorityFeeTracker {
     pub fn new(slot_cache_length: usize) -> Self {
-        let (sampling_txn, sampling_rxn) = channel::<(Vec<Pubkey>, bool, Option<u32>)>(1_000);
+        let (sampling_txn, sampling_rxn) = channel::<(Vec<Pubkey>, bool, Option<u32>)>(100);
 
         let tracker = Self {
             priority_fees: Arc::new(DashMap::new()),
@@ -502,7 +502,7 @@ impl PriorityFeeTracker {
         slots_vec.sort();
         slots_vec.reverse();
 
-        let lookback = calculate_lookback_size(&lookback_period, self.slot_cache.len());
+        let lookback = calculate_lookback_size(&lookback_period, slots_vec.len());
 
         let mut fees = vec![];
         let mut micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates::default();
