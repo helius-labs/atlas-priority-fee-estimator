@@ -45,7 +45,60 @@ impl fmt::Debug for AtlasPriorityFeeEstimator {
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "camelCase"),
 )]
-// TODO: DKH - add deny_unknown_fields
+// TODO: DKH - delete after all the users were notified
+pub struct GetPriorityFeeEstimateRequestLight {
+    pub transaction: Option<String>,       // estimate fee for a txn
+    pub account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
+    pub options: Option<GetPriorityFeeEstimateOptionsLight>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(
+    rename_all(serialize = "camelCase", deserialize = "camelCase"),
+)]
+// TODO: DKH - Delete after all the users were notified
+pub struct GetPriorityFeeEstimateOptionsLight {
+    // controls input txn encoding
+    pub transaction_encoding: Option<UiTransactionEncoding>,
+    // controls custom priority fee level response
+    pub priority_level: Option<PriorityLevel>, // Default to MEDIUM
+    pub include_all_priority_fee_levels: Option<bool>, // Include all priority level estimates in the response
+    #[serde()]
+    pub lookback_slots: Option<u32>, // how many slots to look back on, default 50, min 1, max 300
+    pub include_vote: Option<bool>, // include vote txns in the estimate
+    // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
+    pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
+}
+
+impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight {
+    fn into(self) -> GetPriorityFeeEstimateRequest {
+        let transaction = self.transaction;
+        let account_keys = self.account_keys;
+        let options = self.options.map(|o| {
+            GetPriorityFeeEstimateOptions {
+                transaction_encoding: o.transaction_encoding,
+                priority_level: o.priority_level,
+                include_all_priority_fee_levels: o.include_all_priority_fee_levels,
+                lookback_slots: o.lookback_slots,
+                include_vote: o.include_vote,
+                recommended: o.recommended,
+            }
+        });
+
+        GetPriorityFeeEstimateRequest
+        {
+            transaction,
+            account_keys,
+            options,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[serde(
+    rename_all(serialize = "camelCase", deserialize = "camelCase"),
+    deny_unknown_fields
+)]
 pub struct GetPriorityFeeEstimateRequest {
     pub transaction: Option<String>,       // estimate fee for a txn
     pub account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
@@ -55,8 +108,8 @@ pub struct GetPriorityFeeEstimateRequest {
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "camelCase"),
+    deny_unknown_fields
 )]
-// TODO: DKH - add deny_unknown_fields
 pub struct GetPriorityFeeEstimateOptions {
     // controls input txn encoding
     pub transaction_encoding: Option<UiTransactionEncoding>,
@@ -83,13 +136,22 @@ pub struct GetPriorityFeeEstimateResponse {
 pub trait AtlasPriorityFeeEstimatorRpc {
     #[method(name = "health")]
     fn health(&self) -> String;
+
+    // TODO: DKH - delete after all the users were notified about moving to strict parsing
     #[method(name = "getPriorityFeeEstimate")]
+    fn get_priority_fee_estimate_light(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+    ) -> RpcResult<GetPriorityFeeEstimateResponse>;
+
+    // TODO: DKH - rename annotation method name to "getPriorityFeeEstimateStrict" to "getPriorityFeeEstimate"
+    #[method(name = "getPriorityFeeEstimateStrict")]
     fn get_priority_fee_estimate(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
 
-    #[method(name = "getTestPriorityFeeEstimate")]
+    #[method(name = "getPriorityFeeEstimateTest")]
     fn get_test_priority_fee_estimate(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
@@ -249,9 +311,27 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
     fn health(&self) -> String {
         "ok".to_string()
     }
+    fn get_priority_fee_estimate_light(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+    ) -> RpcResult<GetPriorityFeeEstimateResponse> {
+        let algo_run_fn = |accounts: Vec<Pubkey>,
+                           include_vote: bool,
+                           lookback_period: Option<u32>|
+                           -> MicroLamportPriorityFeeEstimates {
+            self.priority_fee_tracker.get_priority_fee_estimates(
+                accounts,
+                include_vote,
+                lookback_period,
+                true,
+            )
+        };
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request.into(), algo_run_fn)
+    }
+
     fn get_priority_fee_estimate(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         let algo_run_fn = |accounts: Vec<Pubkey>,
                            include_vote: bool,
@@ -265,6 +345,7 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
             )
         };
         self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo_run_fn)
+
     }
 
     fn get_test_priority_fee_estimate(
@@ -516,8 +597,7 @@ mod tests {
         assert_eq!(resp.priority_fee_estimate, Some(10500.0));
     }
 
-    // #[test]
-    // TODO: DKH - add the test back after we readd the validation
+    #[test]
     fn test_parsing_wrong_fields() {
         for (param, error) in bad_params() {
             let json_val = format!("{{\"jsonrpc\": \"2.0\",\"id\": \"1\", \"method\": \"getPriorityFeeEstimate\", \"params\": [{param}] }}");
@@ -549,16 +629,16 @@ mod tests {
 
     fn bad_params<'a>() -> Vec<(&'a str, &'a str)> {
         vec![
-            (r#"{"transactions": null}"#,"unknown field `transactions`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 15"),
-            (r#"{"account_keys": null}"#,"unknown field `account_keys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 15"),
-            (r#"{"accountkeys": null}"#,"unknown field `accountkeys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 14"),
-            (r#"{"accountKeys": [1, 2]}"#, "invalid type: integer `1`, expected a string at line 1 column 18"),
-            (r#"{"option": null}"#, "unknown field `option`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 9"),
-            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended` at line 1 column 35"),
-            (r#"{"options": {"priorityLevel":"HIGH"}}"#, "unknown variant `HIGH`, expected one of `Min`, `Low`, `Medium`, `High`, `VeryHigh`, `UnsafeMax`, `Default` at line 1 column 35"),
-            (r#"{"options": {"includeAllPriorityFeeLevels":"no"}}"#, "invalid type: string \"no\", expected a boolean at line 1 column 47"),
-            (r#"{"options": {"lookbackSlots":"no"}}"#,  "invalid type: string \"no\", expected u32 at line 1 column 33"),
-            (r#"{"options": {"lookbackSlots":"-1"}}"#,  "invalid type: string \"-1\", expected u32 at line 1 column 33"),
+            (r#"{"transactions": null}"#,"unknown field `transactions`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 16"),
+            (r#"{"account_keys": null}"#,"unknown field `account_keys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 16"),
+            (r#"{"accountkeys": null}"#,"unknown field `accountkeys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 15"),
+            (r#"{"accountKeys": [1, 2]}"#, "invalid type: integer `1`, expected a string at line 1 column 19"),
+            (r#"{"option": null}"#, "unknown field `option`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 10"),
+            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended` at line 1 column 36"),
+            (r#"{"options": {"priorityLevel":"HIGH"}}"#, "unknown variant `HIGH`, expected one of `Min`, `Low`, `Medium`, `High`, `VeryHigh`, `UnsafeMax`, `Default` at line 1 column 36"),
+            (r#"{"options": {"includeAllPriorityFeeLevels":"no"}}"#, "invalid type: string \"no\", expected a boolean at line 1 column 48"),
+            (r#"{"options": {"lookbackSlots":"no"}}"#,  "invalid type: string \"no\", expected u32 at line 1 column 34"),
+            (r#"{"options": {"lookbackSlots":"-1"}}"#,  "invalid type: string \"-1\", expected u32 at line 1 column 34"),
         ]
     }
 }

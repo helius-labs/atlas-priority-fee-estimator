@@ -30,6 +30,11 @@ impl SlotCache {
         }
         match self.slot_queue.write() {
             Ok(mut slot_queue) => {
+
+                if self.slot_set.contains(&slot) {
+                    return None;
+                }
+
                 match slot_queue.add(slot) {
                     Ok(maybe_oldest_slot) => {
                         if let Some(oldest_slot) = maybe_oldest_slot
