@@ -132,6 +132,29 @@ pub struct GetPriorityFeeEstimateResponse {
     pub priority_fee_levels: Option<MicroLamportPriorityFeeEstimates>,
 }
 
+impl Into<GetPriorityFeeEstimateRequestLight> for GetPriorityFeeEstimateRequest {
+    fn into(self) -> GetPriorityFeeEstimateRequestLight {
+        let transaction = self.transaction;
+        let account_keys = self.account_keys;
+        let options = self.options.map(|o| {
+            GetPriorityFeeEstimateOptionsLight {
+                transaction_encoding: o.transaction_encoding,
+                priority_level: o.priority_level,
+                include_all_priority_fee_levels: o.include_all_priority_fee_levels,
+                lookback_slots: o.lookback_slots,
+                include_vote: o.include_vote,
+                recommended: o.recommended,
+            }
+        });
+
+        GetPriorityFeeEstimateRequestLight
+        {
+            transaction,
+            account_keys,
+            options,
+        }
+    }
+}
 #[rpc(server)]
 pub trait AtlasPriorityFeeEstimatorRpc {
     #[method(name = "health")]
@@ -143,7 +166,7 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request.into())
+        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request)
     }
 
     // TODO: DKH - rename annotation method name to "getPriorityFeeEstimateStrict" to "getPriorityFeeEstimate"
@@ -152,13 +175,22 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request)
+        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request.into())
+    }
+
+    // TODO: DKH - remove
+    #[method(name = "getPriorityFeeEstimateTest")]
+    fn get_priority_fee_estimate_test(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+    ) -> RpcResult<GetPriorityFeeEstimateResponse> {
+        self.get_priority_fee_estimate_v2(get_priority_fee_estimate_request)
     }
 
     #[method(name = "getPriorityFeeEstimateV1")]
     fn get_priority_fee_estimate_v1(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
 
     #[method(name = "getPriorityFeeEstimateV2")]
@@ -324,7 +356,7 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
 
     fn get_priority_fee_estimate_v1(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         let algo_run_fn = |accounts: Vec<Pubkey>,
                            include_vote: bool,
@@ -337,7 +369,7 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
                 true,
             )
         };
-        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, algo_run_fn)
+        self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request.into(), algo_run_fn)
 
     }
 
