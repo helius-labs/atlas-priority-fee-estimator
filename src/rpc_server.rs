@@ -5,7 +5,6 @@ use std::{
     sync::Arc,
     time::Instant,
 };
-
 use crate::{
     errors::invalid_request,
     priority_fee::{MicroLamportPriorityFeeEstimates, PriorityFeeTracker, PriorityLevel},
@@ -23,8 +22,10 @@ use solana_account_decoder::parse_address_lookup_table::{
 };
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_sdk::message::MessageHeader;
 use solana_transaction_status::UiTransactionEncoding;
 use tracing::info;
+use crate::priority_fee::construct_writable_accounts;
 
 pub struct AtlasPriorityFeeEstimator {
     pub priority_fee_tracker: Arc<PriorityFeeTracker>,
@@ -231,13 +232,28 @@ fn validate_get_priority_fee_estimate_request(
 }
 
 /// returns account keys from transaction
-fn get_from_account_keys(transaction: &VersionedTransaction) -> Vec<String> {
-    transaction
+fn get_from_account_keys(transaction: &VersionedTransaction) -> impl Iterator<Item = String> {
+    let keys: Vec<String> = transaction
         .message
         .static_account_keys()
         .iter()
         .map(|key| key.to_string())
-        .collect()
+        .collect();
+
+    let MessageHeader {
+        num_required_signatures: _num_required_signatures,
+        num_readonly_signed_accounts: _num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts: _num_readonly_unsigned_accounts,
+        ..
+    } = transaction.message.header();
+    let rpc_header = yellowstone_grpc_proto::solana::storage::confirmed_block::MessageHeader {
+        num_required_signatures: *(_num_required_signatures) as u32,
+        num_readonly_signed_accounts: *(_num_readonly_signed_accounts) as u32,
+        num_readonly_unsigned_accounts: *(_num_readonly_unsigned_accounts) as u32,
+    };
+
+    let res = construct_writable_accounts(vec![], keys, &Some(rpc_header));
+    res.into_iter()
 }
 
 /// gets address lookup tables and then fetches them from an RPC. Returns
@@ -245,7 +261,7 @@ fn get_from_account_keys(transaction: &VersionedTransaction) -> Vec<String> {
 fn get_from_address_lookup_tables(
     rpc_client: &RpcClient,
     transaction: &VersionedTransaction,
-) -> Vec<String> {
+) -> impl Iterator<Item = String>{
     let mut account_keys = vec![];
     let address_table_lookups: Option<&[solana_sdk::message::v0::MessageAddressTableLookup]> =
         transaction.message.address_table_lookups();
@@ -311,7 +327,7 @@ fn get_from_address_lookup_tables(
         }
         statsd_time!("get_from_address_lookup_tables", start.elapsed());
     }
-    account_keys
+    account_keys.into_iter()
 }
 
 fn get_accounts(
@@ -337,11 +353,9 @@ fn get_accounts(
             })?;
             let (_, transaction) =
                 decode_and_deserialize::<VersionedTransaction>(transaction, binary_encoding)?;
-            let account_keys: Vec<String> = vec![
-                get_from_account_keys(&transaction),
-                get_from_address_lookup_tables(rpc_client, &transaction),
-            ]
-            .concat();
+            let account_keys: Vec<String> = get_from_account_keys(&transaction)
+                .chain(get_from_address_lookup_tables(rpc_client, &transaction))
+                .collect::<Vec<String>>();
             return Ok(account_keys);
         }
     }
@@ -517,7 +531,7 @@ mod tests {
         let acc1 = Pubkey::new_unique();
         let acc2 = Pubkey::new_unique();
         let tracker = PriorityFeeTracker::new(150);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1, acc2], 100u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1, acc2].into_iter(), 100u64, false);
 
         let server = AtlasPriorityFeeEstimator {
             priority_fee_tracker: Arc::new(tracker),
@@ -542,7 +556,7 @@ mod tests {
         let acc1 = Pubkey::new_unique();
         let acc2 = Pubkey::new_unique();
         let tracker = PriorityFeeTracker::new(150);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1, acc2], 100u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1, acc2].into_iter(), 100u64, false);
 
         let server = AtlasPriorityFeeEstimator {
             priority_fee_tracker: Arc::new(tracker),
@@ -566,8 +580,8 @@ mod tests {
         let acc1 = Pubkey::new_unique();
         let acc2 = Pubkey::new_unique();
         let tracker = PriorityFeeTracker::new(150);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1], 100u64, false);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc2], 200u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1].into_iter(), 100u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc2].into_iter(), 200u64, false);
 
         let server = AtlasPriorityFeeEstimator {
             priority_fee_tracker: Arc::new(tracker),
@@ -600,8 +614,8 @@ mod tests {
         let acc1 = Pubkey::new_unique();
         let acc2 = Pubkey::new_unique();
         let tracker = PriorityFeeTracker::new(150);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1], 100u64, false);
-        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc2], 200u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc1].into_iter(), 100u64, false);
+        tracker.push_priority_fee_for_txn(1 as Slot, vec![acc2].into_iter(), 200u64, false);
 
         let server = AtlasPriorityFeeEstimator {
             priority_fee_tracker: Arc::new(tracker),

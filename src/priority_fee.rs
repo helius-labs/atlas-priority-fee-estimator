@@ -1,21 +1,26 @@
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use crate::grpc_consumer::GrpcConsumer;
+use crate::rpc_server::get_recommended_fee;
+use crate::slot_cache::SlotCache;
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde::Serialize;
+use solana::storage::confirmed_block::Message;
 use solana_program_runtime::compute_budget::ComputeBudget;
+use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
 use solana_sdk::instruction::CompiledInstruction;
+use solana_sdk::transaction::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::{debug, error};
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
-use yellowstone_grpc_proto::geyser::SubscribeUpdate;
-
-use crate::grpc_consumer::GrpcConsumer;
-use crate::rpc_server::get_recommended_fee;
-use crate::slot_cache::SlotCache;
+use yellowstone_grpc_proto::geyser::{SubscribeUpdate, SubscribeUpdateTransactionInfo};
+use yellowstone_grpc_proto::prelude::{MessageHeader, Transaction, TransactionStatusMeta};
+use yellowstone_grpc_proto::solana;
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum PriorityLevel {
@@ -77,7 +82,7 @@ struct SlotPriorityFees {
 type PriorityFeesBySlot = DashMap<Slot, SlotPriorityFees>;
 
 impl SlotPriorityFees {
-    fn new(accounts: Vec<Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
+    fn new(accounts: impl Iterator<Item = Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
         let account_fees = DashMap::new();
         let fees = Fees::new(priority_fee as f64, is_vote);
         for account in accounts {
@@ -96,7 +101,147 @@ pub struct PriorityFeeTracker {
     priority_fees: Arc<PriorityFeesBySlot>,
     compute_budget: ComputeBudget,
     slot_cache: SlotCache,
-    sampling_sender: Sender<(Vec<Pubkey>, bool, Option<u32>)>
+    sampling_sender: Sender<(Vec<Pubkey>, bool, Option<u32>)>,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+enum TransactionValidationError {
+    TransactionFailed,
+    TransactionMissing,
+    MessageMissing,
+    InvalidAccount,
+}
+
+impl Into<&str> for TransactionValidationError {
+    fn into(self) -> &'static str {
+        match self {
+            TransactionValidationError::TransactionFailed => "txn_failed",
+            TransactionValidationError::TransactionMissing => "txn_missing",
+            TransactionValidationError::MessageMissing => "message_missing",
+            TransactionValidationError::InvalidAccount => "invalid_pubkey",
+        }
+    }
+}
+
+fn extract_from_meta(
+    transaction_meta: Option<TransactionStatusMeta>,
+) -> Result<Vec<Pubkey>, TransactionValidationError> {
+    match transaction_meta {
+        None => Ok(Vec::with_capacity(0)),
+        Some(meta) => {
+            if meta.err.is_some() {
+                // statsd_count!("txn_failed", 1);
+                return Result::Err(TransactionValidationError::TransactionFailed);
+            }
+            let writable = meta
+                .loaded_writable_addresses
+                .into_iter()
+                .map(|v| Pubkey::try_from(v))
+                .filter(|p| p.is_ok())
+                .map(|p| p.unwrap())
+                .collect::<Vec<Pubkey>>();
+
+            Ok(writable)
+        }
+    }
+}
+fn extract_from_transaction(
+    mut transaction: SubscribeUpdateTransactionInfo,
+) -> Result<(Message, Vec<Pubkey>, bool), TransactionValidationError> {
+    let writable_accounts = extract_from_meta(transaction.meta.take())?;
+    let tran: &mut Transaction = transaction
+        .transaction
+        .as_mut()
+        .ok_or(TransactionValidationError::TransactionMissing)?;
+    let message: Message = tran
+        .message
+        .take()
+        .ok_or(TransactionValidationError::MessageMissing)?;
+    let is_vote = transaction.is_vote;
+
+    Result::Ok((message, writable_accounts, is_vote))
+}
+
+fn extract_from_message(
+    message: Message,
+) -> Result<
+    (Vec<Pubkey>, Vec<CompiledInstruction>, Option<MessageHeader>),
+    TransactionValidationError,
+> {
+    let account_keys = message.account_keys;
+    let compiled_instructions = message.instructions;
+
+    let accounts: Result<Vec<Pubkey>, _> = account_keys.into_iter().map(Pubkey::try_from).collect();
+    if let Err(_) = accounts {
+        return Err(TransactionValidationError::InvalidAccount);
+    }
+    let accounts = accounts.unwrap();
+
+    let compiled_instructions: Vec<CompiledInstruction> = compiled_instructions
+        .iter()
+        .map(|ix| {
+            CompiledInstruction::new_from_raw_parts(
+                ix.program_id_index as u8,
+                ix.data.clone(),
+                ix.accounts.clone(),
+            )
+        })
+        .collect();
+
+    Ok((accounts, compiled_instructions, message.header))
+}
+
+fn calculate_priority_fee_details(
+    accounts: &Vec<Pubkey>,
+    instructions: &Vec<CompiledInstruction>,
+    budget: &mut ComputeBudget,
+) -> Result<PrioritizationFeeDetails, TransactionError> {
+    let instructions_for_processing: HashMap<&Pubkey, &CompiledInstruction> = instructions
+        .iter()
+        .filter_map(|ix: &CompiledInstruction| {
+            let account = accounts.get(ix.program_id_index as usize);
+            if account.is_none() {
+                statsd_count!("program_id_index_not_found", 1);
+                return None;
+            }
+            Some((account.unwrap(), ix))
+        })
+        .collect();
+
+    budget.process_instructions(instructions_for_processing.into_iter(), true, true)
+}
+
+pub(crate) fn construct_writable_accounts<T: Eq + std::hash::Hash>(
+    writable_accounts: Vec<T>,
+    message_accounts: Vec<T>,
+    header: &Option<MessageHeader>,
+) -> HashSet<T> {
+    if header.is_none() {
+        return message_accounts
+            .into_iter()
+            .chain(writable_accounts.into_iter())
+            .collect::<HashSet<T>>();
+    }
+
+    let header = header.as_ref().unwrap();
+    let min_pos_non_sig_write_accts = header.num_required_signatures as usize;
+    let max_pos_write_sig =
+        min_pos_non_sig_write_accts.saturating_sub(header.num_readonly_signed_accounts as usize);
+    let max_non_sig_write_accts = message_accounts
+        .len()
+        .checked_sub(header.num_readonly_unsigned_accounts as usize)
+        .unwrap_or(message_accounts.len());
+
+    message_accounts
+        .into_iter()
+        .enumerate()
+        .filter(|data: &(usize, T)| {
+            data.0 < max_pos_write_sig
+                || (data.0 >= min_pos_non_sig_write_accts && data.0 < max_non_sig_write_accts)
+        })
+        .map(|data: (usize, T)| data.1)
+        .chain(writable_accounts.into_iter())
+        .collect::<HashSet<T>>()
 }
 
 impl GrpcConsumer for PriorityFeeTracker {
@@ -107,77 +252,40 @@ impl GrpcConsumer for PriorityFeeTracker {
                 statsd_count!("txns_received", block.transactions.len() as i64);
                 let slot = block.slot;
                 for txn in block.transactions {
-                    // skip failed txs
-                    if txn.meta.map_or(false, |meta| meta.err.is_some()) {
-                        statsd_count!("txn_failed", 1);
+                    let res = extract_from_transaction(txn);
+                    if let Err(error) = res {
+                        statsd_count!(error.into(), 1);
                         continue;
                     }
-                    if txn.transaction.is_none() {
-                        statsd_count!("txn_missing", 1);
-                        continue;
-                    }
-                    let transaction = txn.transaction.unwrap();
-                    let message = transaction.message;
-                    if message.is_none() {
-                        statsd_count!("message_missing", 1);
-                        continue;
-                    }
-                    let message = message.unwrap();
-                    let mut account_keys = message.account_keys;
-                    for lookup in message.address_table_lookups {
-                        account_keys.push(lookup.account_key);
-                    }
-                    let accounts: Vec<Pubkey> = account_keys
-                        .into_iter()
-                        .filter_map(|p| {
-                            let pubkey: Option<[u8; 32]> = p.try_into().ok();
-                            if pubkey.is_none() {
-                                statsd_count!("invalid_pubkey", 1);
-                            }
-                            pubkey
-                        })
-                        .map(|p| Pubkey::new_from_array(p))
-                        .collect();
+                    let (message, writable_accounts, is_vote) = res.unwrap();
 
-                    let compiled_instructions: Vec<CompiledInstruction> = message
-                        .instructions
-                        .iter()
-                        .map(|ix| {
-                            CompiledInstruction::new_from_raw_parts(
-                                ix.program_id_index as u8,
-                                ix.data.clone(),
-                                ix.accounts.clone(),
-                            )
-                        })
-                        .collect();
-                    let instructions_for_processing: Vec<(&Pubkey, &CompiledInstruction)> =
-                        compiled_instructions
-                            .iter()
-                            .filter_map(|ix| {
-                                let account = accounts.get(ix.program_id_index as usize);
-                                if account.is_none() {
-                                    statsd_count!("program_id_index_not_found", 1);
-                                    return None;
-                                }
-                                Some((account.unwrap(), ix))
-                            })
-                            .collect();
+                    let res = extract_from_message(message);
+                    if let Err(error) = res {
+                        statsd_count!(error.into(), 1);
+                        continue;
+                    }
+                    let (accounts, instructions, header) = res.unwrap();
+                    let mut compute_budget = self.compute_budget;
+                    let priority_fee_details = calculate_priority_fee_details(
+                        &accounts,
+                        &instructions,
+                        &mut compute_budget,
+                    );
+
+                    let writable_accounts =
+                        construct_writable_accounts(writable_accounts, accounts, &header);
+
                     statsd_count!(
                         "priority_fee_tracker.accounts_processed",
-                        accounts.len() as i64
-                    );
-                    let priority_fee_details = self.compute_budget.clone().process_instructions(
-                        instructions_for_processing.into_iter(),
-                        true,
-                        true,
+                        writable_accounts.len() as i64
                     );
                     statsd_count!("txns_processed", 1);
                     match priority_fee_details {
                         Ok(priority_fee_details) => self.push_priority_fee_for_txn(
                             slot,
-                            accounts,
+                            writable_accounts.into_iter(),
                             priority_fee_details.get_priority(),
-                            txn.is_vote,
+                            is_vote,
                         ),
                         Err(e) => {
                             error!("error processing priority fee details: {:?}", e);
@@ -222,13 +330,12 @@ impl PriorityFeeTracker {
             // task to poll the queue and run comparison to see what is the diff between algos
             tokio::spawn(async move {
                 loop {
-                    match sampling_rxn.recv().await
-                    {
-                        Some((accounts, include_vote, lookback_period)) =>
-                            priority_fee_tracker.record_specific_fees(accounts, include_vote, lookback_period),
-                        _ => {},
+                    match sampling_rxn.recv().await {
+                        Some((accounts, include_vote, lookback_period)) => priority_fee_tracker
+                            .record_specific_fees(accounts, include_vote, lookback_period),
+                        _ => {}
                     }
-                };
+                }
             });
         }
     }
@@ -268,8 +375,12 @@ impl PriorityFeeTracker {
         );
     }
 
-    fn record_specific_fees(&self, accounts: Vec<Pubkey>, include_vote: bool, lookback_period: Option<u32>)
-    {
+    fn record_specific_fees(
+        &self,
+        accounts: Vec<Pubkey>,
+        include_vote: bool,
+        lookback_period: Option<u32>,
+    ) {
         let old_fee = self.calculation1(&accounts, include_vote, &lookback_period);
         let new_fee = self.calculation2(&accounts, include_vote, &lookback_period);
         let new_fee_last = self.calculation2(&accounts, include_vote, &Some(1));
@@ -387,7 +498,7 @@ impl PriorityFeeTracker {
     pub fn push_priority_fee_for_txn(
         &self,
         slot: Slot,
-        accounts: Vec<Pubkey>,
+        accounts: impl Iterator<Item = Pubkey>,
         priority_fee: u64,
         is_vote: bool,
     ) {
@@ -415,8 +526,6 @@ impl PriorityFeeTracker {
         }
     }
 
-
-
     // TODO: DKH - both algos should probably be in some enum (like algo1, algo2) and be passed to
     // this method instead of sending a bool flag. I'll refactor this in next iteration. already too many changes
     pub fn get_priority_fee_estimates(
@@ -424,14 +533,12 @@ impl PriorityFeeTracker {
         accounts: Vec<Pubkey>,
         include_vote: bool,
         lookback_period: Option<u32>,
-        calculation1: bool
+        calculation1: bool,
     ) -> MicroLamportPriorityFeeEstimates {
         let start = Instant::now();
-        let micro_lamport_priority_fee_estimates = if calculation1
-        {
+        let micro_lamport_priority_fee_estimates = if calculation1 {
             self.calculation1(&accounts, include_vote, &lookback_period)
-        }
-        else {
+        } else {
             self.calculation2(&accounts, include_vote, &lookback_period)
         };
 
@@ -439,9 +546,11 @@ impl PriorityFeeTracker {
             "get_priority_fee_estimates_time",
             start.elapsed().as_nanos() as u64
         );
-        if let Err(e) = self.sampling_sender
-            .try_send((accounts.to_owned(), include_vote, lookback_period.to_owned()))
-        {
+        if let Err(e) = self.sampling_sender.try_send((
+            accounts.to_owned(),
+            include_vote,
+            lookback_period.to_owned(),
+        )) {
             debug!("Did not add sample for calculation, {:?}", e);
         }
 
@@ -455,7 +564,12 @@ impl PriorityFeeTracker {
      3. will calculate the percentile distributions for each of two groups
      4. will choose the highest value from each percentile between two groups
      */
-    fn calculation1(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
+    fn calculation1(
+        &self,
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        lookback_period: &Option<u32>,
+    ) -> MicroLamportPriorityFeeEstimates {
         let mut account_fees = vec![];
         let mut transaction_fees = vec![];
         for (i, slot_priority_fees) in self.priority_fees.iter().enumerate() {
@@ -490,13 +604,17 @@ impl PriorityFeeTracker {
     }
 
     /*
-        Algo2: given the list of accounts the algorithm will:
-         1. collect all the transactions fees over n slots
-         2. for each specified account collect the fees and calculate the percentiles
-         4. choose maximum values for each percentile between all transactions and each account
-         */
-    fn calculation2(&self, accounts: &Vec<Pubkey>, include_vote: bool, lookback_period: &Option<u32>) -> MicroLamportPriorityFeeEstimates {
-
+    Algo2: given the list of accounts the algorithm will:
+     1. collect all the transactions fees over n slots
+     2. for each specified account collect the fees and calculate the percentiles
+     4. choose maximum values for each percentile between all transactions and each account
+     */
+    fn calculation2(
+        &self,
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        lookback_period: &Option<u32>,
+    ) -> MicroLamportPriorityFeeEstimates {
         let mut slots_vec = Vec::with_capacity(self.slot_cache.len());
         self.slot_cache.copy_slots(&mut slots_vec);
         slots_vec.sort();
@@ -508,24 +626,21 @@ impl PriorityFeeTracker {
         let mut micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates::default();
 
         for slot in &slots_vec[..lookback] {
-            if let Some(slot_priority_fees) = self.priority_fees.get(slot)
-            {
+            if let Some(slot_priority_fees) = self.priority_fees.get(slot) {
                 if include_vote {
                     fees.extend_from_slice(&slot_priority_fees.fees.vote_fees);
                 }
                 fees.extend_from_slice(&slot_priority_fees.fees.non_vote_fees);
             }
         }
-        micro_lamport_priority_fee_estimates = estimate_max_values(&mut fees,
-                                                                   micro_lamport_priority_fee_estimates);
+        micro_lamport_priority_fee_estimates =
+            estimate_max_values(&mut fees, micro_lamport_priority_fee_estimates);
 
         for account in accounts {
             fees.clear();
 
             for slot in &slots_vec[..lookback] {
-
-                if let Some(slot_priority_fees) = self.priority_fees.get(slot)
-                {
+                if let Some(slot_priority_fees) = self.priority_fees.get(slot) {
                     let account_priority_fees = slot_priority_fees.account_fees.get(account);
                     if let Some(account_priority_fees) = account_priority_fees {
                         if include_vote {
@@ -535,8 +650,8 @@ impl PriorityFeeTracker {
                     }
                 }
             }
-            micro_lamport_priority_fee_estimates = estimate_max_values(&mut fees,
-                                                                       micro_lamport_priority_fee_estimates);
+            micro_lamport_priority_fee_estimates =
+                estimate_max_values(&mut fees, micro_lamport_priority_fee_estimates);
         }
         micro_lamport_priority_fee_estimates
     }
@@ -622,8 +737,7 @@ fn percentile(values: &mut Vec<f64>, percentile: Percentile) -> f64 {
     let n = values.len() as f64;
     let r = (percentile as f64 / 100.0) * (n - 1.0) + 1.0;
 
-    let val =
-        if r.fract() == 0.0 {
+    let val = if r.fract() == 0.0 {
         values[r as usize - 1]
     } else {
         let ri = r.trunc() as usize - 1;
@@ -664,12 +778,11 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for fee in fees.clone() {
-            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -684,10 +797,8 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -723,12 +834,11 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone().into_iter(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_min_fee = 1.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
@@ -742,10 +852,8 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_min_fee = 1.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
@@ -781,12 +889,11 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone().into_iter(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
@@ -796,10 +903,8 @@ mod tests {
         assert_ne!(estimates.high, expected_high_fee);
         assert_ne!(estimates.very_high, expected_very_high_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
@@ -827,25 +932,25 @@ mod tests {
             match val {
                 0..=24 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_1],
+                    vec![account_1].into_iter(),
                     val as u64,
                     false,
                 ),
                 25..=49 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_2],
+                    vec![account_2].into_iter(),
                     val as u64,
                     false,
                 ),
                 50..=74 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_3],
+                    vec![account_3].into_iter(),
                     val as u64,
                     false,
                 ),
                 75..=99 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_4],
+                    vec![account_4].into_iter(),
                     val as u64,
                     false,
                 ),
@@ -854,8 +959,7 @@ mod tests {
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![account_1, account_4], false, &None);
+        let estimates = tracker.calculation1(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 0.0;
         let expected_low_fee = 24.75;
         let expected_medium_fee = 49.5;
@@ -869,11 +973,8 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![account_1, account_4], false, &None);
+        let estimates = tracker.calculation2(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 75.0;
         let expected_low_fee = 81.0;
         let expected_medium_fee = 87.0;
@@ -907,25 +1008,25 @@ mod tests {
             match val {
                 val if 0 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_1],
+                    vec![account_1].into_iter(),
                     val as u64,
                     false,
                 ),
                 val if 1 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_2],
+                    vec![account_2].into_iter(),
                     val as u64,
                     false,
                 ),
                 val if 2 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_3],
+                    vec![account_3].into_iter(),
                     val as u64,
                     false,
                 ),
                 val if 3 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_4],
+                    vec![account_4].into_iter(),
                     val as u64,
                     false,
                 ),
@@ -933,10 +1034,8 @@ mod tests {
             }
         }
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![account_1, account_4], false, &None);
+        let estimates = tracker.calculation1(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 0.0;
         let expected_low_fee = 24.75;
         let expected_medium_fee = 49.5;
@@ -950,11 +1049,8 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![account_1, account_4], false, &None);
+        let estimates = tracker.calculation2(&vec![account_1, account_4], false, &None);
         let expected_min_fee = 3.0;
         let expected_low_fee = 27.0;
         let expected_medium_fee = 51.0;
@@ -986,15 +1082,14 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for fee in fees.clone() {
-            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), fee as u64, false);
         }
         for _ in 0..10 {
-            tracker.push_priority_fee_for_txn(1, accounts.clone(), 1000000, true);
+            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), 1000000, true);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -1008,11 +1103,9 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates =
-            tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
+        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, &None);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
@@ -1026,5 +1119,110 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
+    }
+
+    #[test]
+    fn test_constructing_accounts()
+    {
+        for (test_id, data) in generate_data().iter().enumerate()
+        {
+            let (writable_accounts, message_accounts, header, expectation) = data;
+            let result = construct_writable_accounts(writable_accounts.clone(), message_accounts.clone(), header);
+            let diff1 = expectation - &result;
+            let diff2 = &result - expectation;
+
+            assert!(diff1.is_empty(), "Error ${test_id}: {:?}, {:?}, {:?} not equal to {:?}",
+                       writable_accounts, message_accounts, header, expectation);
+            assert!(diff2.is_empty(), "Error ${test_id}: {:?}, {:?}, {:?} not equal to {:?}",
+                    writable_accounts, message_accounts, header, expectation);
+        }
+    }
+
+    fn generate_data() -> Vec<(Vec<Pubkey>, Vec<Pubkey>, Option<MessageHeader>, HashSet<Pubkey>)>
+    {
+        let p1 = Pubkey::new_unique();
+        let p2 = Pubkey::new_unique();
+        let p3 = Pubkey::new_unique();
+        let p4 = Pubkey::new_unique();
+        let p5 = Pubkey::new_unique();
+
+        vec!(
+            (Vec::with_capacity(0), Vec::with_capacity(0), None, HashSet::with_capacity(0)),
+            (vec!(p1), Vec::with_capacity(0), None, HashSet::from([p1])),
+            (vec!(p1, p2), Vec::with_capacity(0), None, HashSet::from([p1, p2])),
+            (vec!(p1), vec!(p2), None, HashSet::from([p1, p2])),
+            (vec!(p1), vec!(p1), None, HashSet::from([p1])),
+            // one unsigned account
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            }), HashSet::from([p1, p2, p3])),
+            // 2 unsigned accounts
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 2,
+            }), HashSet::from([p1, p2])),
+            // all unsigned accounts
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 0,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 2,
+            }), HashSet::from([p1, p2])),
+
+            // should not happen but just in case we should check that we can handle bad data
+            // too many signatures
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 5,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 0,
+            }), HashSet::from([p1, p2, p3, p4])),
+
+            // too many read only signed
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 0,
+                num_readonly_signed_accounts: 5,
+                num_readonly_unsigned_accounts: 0,
+            }), HashSet::from([p1, p2, p3, p4])),
+
+            // too many read only signed
+            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
+                num_required_signatures: 0,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 5,
+            }), HashSet::from([p1, p2, p3, p4])),
+
+
+            // too many read only signed
+            (vec!(p1, p2), vec!(p3, p4, p5), Some(MessageHeader{
+                num_required_signatures: 0,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 5,
+            }), HashSet::from([p1, p2, p3, p4, p5])),
+
+            // Specific cases for signed read accounts
+            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
+                num_required_signatures: 2,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 1,
+            }), HashSet::from([p1, p2, p4])),
+
+
+            // Specific cases for signed read accounts
+            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
+                num_required_signatures: 2,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 2,
+            }), HashSet::from([p1, p2])),
+
+            // Specific cases for signed read accounts
+            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 2,
+            }), HashSet::from([p1, p3])),
+
+        )
     }
 }
