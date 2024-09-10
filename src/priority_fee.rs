@@ -12,7 +12,7 @@ use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::transaction::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -82,7 +82,7 @@ struct SlotPriorityFees {
 type PriorityFeesBySlot = DashMap<Slot, SlotPriorityFees>;
 
 impl SlotPriorityFees {
-    fn new(accounts: impl Iterator<Item = Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
+    fn new(accounts: Vec<Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
         let account_fees = DashMap::new();
         let fees = Fees::new(priority_fee as f64, is_vote);
         for account in accounts {
@@ -211,16 +211,12 @@ fn calculate_priority_fee_details(
     budget.process_instructions(instructions_for_processing.into_iter(), true, true)
 }
 
-pub(crate) fn construct_writable_accounts<T: Eq + std::hash::Hash>(
-    writable_accounts: Vec<T>,
+pub(crate) fn construct_writable_accounts<T>(
     message_accounts: Vec<T>,
     header: &Option<MessageHeader>,
-) -> HashSet<T> {
+) -> Vec<T> {
     if header.is_none() {
-        return message_accounts
-            .into_iter()
-            .chain(writable_accounts.into_iter())
-            .collect::<HashSet<T>>();
+        return message_accounts;
     }
 
     let header = header.as_ref().unwrap();
@@ -240,8 +236,7 @@ pub(crate) fn construct_writable_accounts<T: Eq + std::hash::Hash>(
                 || (data.0 >= min_pos_non_sig_write_accts && data.0 < max_non_sig_write_accts)
         })
         .map(|data: (usize, T)| data.1)
-        .chain(writable_accounts.into_iter())
-        .collect::<HashSet<T>>()
+        .collect()
 }
 
 impl GrpcConsumer for PriorityFeeTracker {
@@ -272,8 +267,10 @@ impl GrpcConsumer for PriorityFeeTracker {
                         &mut compute_budget,
                     );
 
-                    let writable_accounts =
-                        construct_writable_accounts(writable_accounts, accounts, &header);
+                    let writable_accounts = vec!(
+                        construct_writable_accounts(accounts, &header),
+                        writable_accounts
+                    ).concat();
 
                     statsd_count!(
                         "priority_fee_tracker.accounts_processed",
@@ -283,7 +280,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                     match priority_fee_details {
                         Ok(priority_fee_details) => self.push_priority_fee_for_txn(
                             slot,
-                            writable_accounts.into_iter(),
+                            writable_accounts,
                             priority_fee_details.get_priority(),
                             is_vote,
                         ),
@@ -498,7 +495,7 @@ impl PriorityFeeTracker {
     pub fn push_priority_fee_for_txn(
         &self,
         slot: Slot,
-        accounts: impl Iterator<Item = Pubkey>,
+        accounts: Vec<Pubkey>,
         priority_fee: u64,
         is_vote: bool,
     ) {
@@ -749,6 +746,7 @@ fn percentile(values: &mut Vec<f64>, percentile: Percentile) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use cadence::{NopMetricSink, StatsdClient};
     use cadence_macros::set_global_default;
 
@@ -778,7 +776,7 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for fee in fees.clone() {
-            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -834,7 +832,12 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone().into_iter(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(
+                i as Slot,
+                accounts.clone(),
+                fee as u64,
+                false,
+            );
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -889,7 +892,12 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone().into_iter(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(
+                i as Slot,
+                accounts.clone(),
+                fee as u64,
+                false,
+            );
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -932,25 +940,25 @@ mod tests {
             match val {
                 0..=24 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_1].into_iter(),
+                    vec![account_1],
                     val as u64,
                     false,
                 ),
                 25..=49 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_2].into_iter(),
+                    vec![account_2],
                     val as u64,
                     false,
                 ),
                 50..=74 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_3].into_iter(),
+                    vec![account_3],
                     val as u64,
                     false,
                 ),
                 75..=99 => tracker.push_priority_fee_for_txn(
                     val as Slot,
-                    vec![account_4].into_iter(),
+                    vec![account_4],
                     val as u64,
                     false,
                 ),
@@ -1008,25 +1016,25 @@ mod tests {
             match val {
                 val if 0 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_1].into_iter(),
+                    vec![account_1],
                     val as u64,
                     false,
                 ),
                 val if 1 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_2].into_iter(),
+                    vec![account_2],
                     val as u64,
                     false,
                 ),
                 val if 2 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_3].into_iter(),
+                    vec![account_3],
                     val as u64,
                     false,
                 ),
                 val if 3 == val % 4 => tracker.push_priority_fee_for_txn(
                     slot as Slot,
-                    vec![account_4].into_iter(),
+                    vec![account_4],
                     val as u64,
                     false,
                 ),
@@ -1082,10 +1090,10 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for fee in fees.clone() {
-            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), fee as u64, false);
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
         }
         for _ in 0..10 {
-            tracker.push_priority_fee_for_txn(1, accounts.clone().into_iter(), 1000000, true);
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), 1000000, true);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -1122,107 +1130,145 @@ mod tests {
     }
 
     #[test]
-    fn test_constructing_accounts()
-    {
-        for (test_id, data) in generate_data().iter().enumerate()
-        {
-            let (writable_accounts, message_accounts, header, expectation) = data;
-            let result = construct_writable_accounts(writable_accounts.clone(), message_accounts.clone(), header);
-            let diff1 = expectation - &result;
-            let diff2 = &result - expectation;
+    fn test_constructing_accounts() {
+        for (test_id, data) in generate_data().iter().enumerate() {
+            let (message_accounts, header, expectation) = data;
+            let result = construct_writable_accounts(message_accounts.clone(), header);
+            assert_eq!(result.len(), expectation.len());
+            let expectation = &expectation.clone().into_iter().collect::<HashSet<Pubkey>>();
+            let result = &result.clone().into_iter().collect::<HashSet<Pubkey>>();
+            let diff1 = expectation - result;
+            let diff2 = result - expectation;
 
-            assert!(diff1.is_empty(), "Error ${test_id}: {:?}, {:?}, {:?} not equal to {:?}",
-                       writable_accounts, message_accounts, header, expectation);
-            assert!(diff2.is_empty(), "Error ${test_id}: {:?}, {:?}, {:?} not equal to {:?}",
-                    writable_accounts, message_accounts, header, expectation);
+            assert!(
+                diff1.is_empty(),
+                "Error ${test_id}: {:?}, {:?} not equal to {:?}",
+                message_accounts,
+                header,
+                expectation
+            );
+            assert!(
+                diff2.is_empty(),
+                "Error ${test_id}: {:?}, {:?} not equal to {:?}",
+                message_accounts,
+                header,
+                expectation
+            );
         }
     }
 
-    fn generate_data() -> Vec<(Vec<Pubkey>, Vec<Pubkey>, Option<MessageHeader>, HashSet<Pubkey>)>
-    {
+    fn generate_data() -> Vec<(Vec<Pubkey>, Option<MessageHeader>, Vec<Pubkey>)> {
         let p1 = Pubkey::new_unique();
         let p2 = Pubkey::new_unique();
         let p3 = Pubkey::new_unique();
         let p4 = Pubkey::new_unique();
         let p5 = Pubkey::new_unique();
 
-        vec!(
-            (Vec::with_capacity(0), Vec::with_capacity(0), None, HashSet::with_capacity(0)),
-            (vec!(p1), Vec::with_capacity(0), None, HashSet::from([p1])),
-            (vec!(p1, p2), Vec::with_capacity(0), None, HashSet::from([p1, p2])),
-            (vec!(p1), vec!(p2), None, HashSet::from([p1, p2])),
-            (vec!(p1), vec!(p1), None, HashSet::from([p1])),
+        vec![
+            (Vec::with_capacity(0), None, Vec::with_capacity(0)),
+            (vec![p1], None, vec![p1]),
+            (vec![p1, p2], None, vec![p1, p2]),
             // one unsigned account
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 1,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 1,
-            }), HashSet::from([p1, p2, p3])),
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 1,
+                }),
+                vec![p2, p3],
+            ),
             // 2 unsigned accounts
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 1,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 2,
-            }), HashSet::from([p1, p2])),
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 2,
+                }),
+                vec![p2],
+            ),
             // all unsigned accounts
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 0,
-                num_readonly_signed_accounts: 1,
-                num_readonly_unsigned_accounts: 2,
-            }), HashSet::from([p1, p2])),
-
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 0,
+                    num_readonly_signed_accounts: 1,
+                    num_readonly_unsigned_accounts: 2,
+                }),
+                vec![p2],
+            ),
             // should not happen but just in case we should check that we can handle bad data
             // too many signatures
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 5,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 0,
-            }), HashSet::from([p1, p2, p3, p4])),
-
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 5,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 0,
+                }),
+                vec![p2, p3, p4],
+            ),
             // too many read only signed
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 0,
-                num_readonly_signed_accounts: 5,
-                num_readonly_unsigned_accounts: 0,
-            }), HashSet::from([p1, p2, p3, p4])),
-
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 0,
+                    num_readonly_signed_accounts: 5,
+                    num_readonly_unsigned_accounts: 0,
+                }),
+                vec![p2, p3, p4],
+            ),
             // too many read only signed
-            (vec!(p1), vec!(p2, p3, p4), Some(MessageHeader{
-                num_required_signatures: 0,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 5,
-            }), HashSet::from([p1, p2, p3, p4])),
-
-
+            (
+                vec![p2, p3, p4],
+                Some(MessageHeader {
+                    num_required_signatures: 0,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 5,
+                }),
+                vec![p2, p3, p4],
+            ),
             // too many read only signed
-            (vec!(p1, p2), vec!(p3, p4, p5), Some(MessageHeader{
-                num_required_signatures: 0,
-                num_readonly_signed_accounts: 0,
-                num_readonly_unsigned_accounts: 5,
-            }), HashSet::from([p1, p2, p3, p4, p5])),
-
+            (
+                vec![p3, p4, p5],
+                Some(MessageHeader {
+                    num_required_signatures: 0,
+                    num_readonly_signed_accounts: 0,
+                    num_readonly_unsigned_accounts: 5,
+                }),
+                vec![p3, p4, p5],
+            ),
             // Specific cases for signed read accounts
-            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
-                num_required_signatures: 2,
-                num_readonly_signed_accounts: 1,
-                num_readonly_unsigned_accounts: 1,
-            }), HashSet::from([p1, p2, p4])),
-
-
+            (
+                vec![p2, p3, p4, p5],
+                Some(MessageHeader {
+                    num_required_signatures: 2,
+                    num_readonly_signed_accounts: 1,
+                    num_readonly_unsigned_accounts: 1,
+                }),
+                vec![p2, p4],
+            ),
             // Specific cases for signed read accounts
-            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
-                num_required_signatures: 2,
-                num_readonly_signed_accounts: 1,
-                num_readonly_unsigned_accounts: 2,
-            }), HashSet::from([p1, p2])),
-
+            (
+                vec![p2, p3, p4, p5],
+                Some(MessageHeader {
+                    num_required_signatures: 2,
+                    num_readonly_signed_accounts: 1,
+                    num_readonly_unsigned_accounts: 2,
+                }),
+                vec![p2],
+            ),
             // Specific cases for signed read accounts
-            (vec!(p1), vec!(p2, p3, p4, p5), Some(MessageHeader{
-                num_required_signatures: 1,
-                num_readonly_signed_accounts: 1,
-                num_readonly_unsigned_accounts: 2,
-            }), HashSet::from([p1, p3])),
-
-        )
+            (
+                vec![p2, p3, p4, p5],
+                Some(MessageHeader {
+                    num_required_signatures: 1,
+                    num_readonly_signed_accounts: 1,
+                    num_readonly_unsigned_accounts: 2,
+                }),
+                vec![p3],
+            ),
+        ]
     }
 }
