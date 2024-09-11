@@ -23,8 +23,10 @@ use solana_account_decoder::parse_address_lookup_table::{
 };
 use solana_client::rpc_client::RpcClient;
 use solana_sdk::{pubkey::Pubkey, transaction::VersionedTransaction};
+use solana_sdk::message::MessageHeader;
 use solana_transaction_status::UiTransactionEncoding;
 use tracing::info;
+use crate::priority_fee::construct_writable_accounts;
 
 pub struct AtlasPriorityFeeEstimator {
     pub priority_fee_tracker: Arc<PriorityFeeTracker>,
@@ -232,12 +234,26 @@ fn validate_get_priority_fee_estimate_request(
 
 /// returns account keys from transaction
 fn get_from_account_keys(transaction: &VersionedTransaction) -> Vec<String> {
-    transaction
+    let keys: Vec<String> = transaction
         .message
         .static_account_keys()
         .iter()
         .map(|key| key.to_string())
-        .collect()
+        .collect();
+
+    let MessageHeader {
+        num_required_signatures: _num_required_signatures,
+        num_readonly_signed_accounts: _num_readonly_signed_accounts,
+        num_readonly_unsigned_accounts: _num_readonly_unsigned_accounts,
+        ..
+    } = transaction.message.header();
+    let rpc_header = yellowstone_grpc_proto::solana::storage::confirmed_block::MessageHeader {
+        num_required_signatures: *(_num_required_signatures) as u32,
+        num_readonly_signed_accounts: *(_num_readonly_signed_accounts) as u32,
+        num_readonly_unsigned_accounts: *(_num_readonly_unsigned_accounts) as u32,
+    };
+
+    construct_writable_accounts(keys, &Some(rpc_header))
 }
 
 /// gets address lookup tables and then fetches them from an RPC. Returns
