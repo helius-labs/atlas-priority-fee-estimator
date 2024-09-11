@@ -12,7 +12,6 @@ use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::transaction::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -196,7 +195,7 @@ fn calculate_priority_fee_details(
     instructions: &Vec<CompiledInstruction>,
     budget: &mut ComputeBudget,
 ) -> Result<PrioritizationFeeDetails, TransactionError> {
-    let instructions_for_processing: HashMap<&Pubkey, &CompiledInstruction> = instructions
+    let instructions_for_processing: Vec<(&Pubkey, &CompiledInstruction)> = instructions
         .iter()
         .filter_map(|ix: &CompiledInstruction| {
             let account = accounts.get(ix.program_id_index as usize);
