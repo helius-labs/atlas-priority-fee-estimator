@@ -39,3 +39,5 @@ rand = "0.8.5"
 futures = "0.3.24"
 figment = { version = "0.10.6", features = ["env", "test"] }
 tower = { version = "0.4.13", features = ["full"] }
+thiserror = "1.0.63"
+anyhow = "1.0.86"

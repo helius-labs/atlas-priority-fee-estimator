@@ -266,10 +266,11 @@ impl GrpcConsumer for PriorityFeeTracker {
                         &mut compute_budget,
                     );
 
-                    let writable_accounts = vec!(
+                    let writable_accounts = vec![
                         construct_writable_accounts(accounts, &header),
-                        writable_accounts
-                    ).concat();
+                        writable_accounts,
+                    ]
+                    .concat();
 
                     statsd_count!(
                         "priority_fee_tracker.accounts_processed",
@@ -538,9 +539,16 @@ impl PriorityFeeTracker {
             self.calculation2(&accounts, include_vote, &lookback_period)
         };
 
+        let version = if calculation1 { "v1" } else { "v2" };
         statsd_gauge!(
             "get_priority_fee_estimates_time",
-            start.elapsed().as_nanos() as u64
+            start.elapsed().as_nanos() as u64,
+            "version" => &version
+        );
+        statsd_count!(
+            "get_priority_fee_calculation_version",
+            1,
+            "version" => &version
         );
         if let Err(e) = self.sampling_sender.try_send((
             accounts.to_owned(),
@@ -745,11 +753,14 @@ fn percentile(values: &mut Vec<f64>, percentile: Percentile) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use super::*;
+    use anyhow::Context;
     use cadence::{NopMetricSink, StatsdClient};
     use cadence_macros::set_global_default;
-
-    use super::*;
+    use solana_sdk::compute_budget::ComputeBudgetInstruction::{
+        RequestHeapFrame, SetComputeUnitLimit, SetComputeUnitPrice, SetLoadedAccountsDataSizeLimit,
+    };
+    use std::collections::HashSet;
 
     fn init_metrics() {
         let noop = NopMetricSink {};
@@ -831,12 +842,7 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(
-                i as Slot,
-                accounts.clone(),
-                fee as u64,
-                false,
-            );
+            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -891,12 +897,7 @@ mod tests {
 
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
-            tracker.push_priority_fee_for_txn(
-                i as Slot,
-                accounts.clone(),
-                fee as u64,
-                false,
-            );
+            tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
@@ -1154,6 +1155,79 @@ mod tests {
                 expectation
             );
         }
+    }
+
+    const MICRO_LAMPORTS_PER_LAMPORT: u128 = 1_000_000;
+    #[test]
+    fn test_budget_calculation() -> Result<(), anyhow::Error> {
+        // Ok(PrioritizationFeeDetails { fee: 4923, priority: 39066 })
+        let account_keys = [
+            "89oWV7LXUtEgh4sYQS7gBGPVvsznCzgf9ip5h7SHWDSr", // random account
+            "GitvMpoCygGyDGUK4SMZdHpEqCqwif2cnuLAhmca96zw", // random account
+            "731dL3MmiEKaAT711BWxizxKyHcwLxqWQ2pLroPmbMye", // random account
+            "ComputeBudget111111111111111111111111111111",  // budget program system account
+            "11111111111111111111111111111111",             // budget program for accounts account
+        ];
+
+        let comp1 = SetComputeUnitLimit(100_000)
+            .pack()
+            .context("Could not pack compute unit limit")?;
+        let comp2 = SetComputeUnitPrice(200_000)
+            .pack()
+            .context("Could not pack compute unit price")?;
+        let comp3 = SetLoadedAccountsDataSizeLimit(300_000)
+            .pack()
+            .context("Could not pack loaded account data size limit")?;
+        let comp4 = RequestHeapFrame(64 * 1024)
+            .pack()
+            .context("Could not pack request for heap frame")?;
+
+        let random_account = "some app -- ignore".as_bytes().to_vec();
+        let instructions = [
+            (2u8, random_account, vec![]),
+            (3u8, comp1.clone(), Vec::with_capacity(0)),
+            (3u8, comp2.clone(), Vec::with_capacity(0)),
+            (3u8, comp3.clone(), Vec::with_capacity(0)),
+            (3u8, comp4.clone(), Vec::with_capacity(0)),
+            (4u8, comp1, vec![0u8, 1u8].to_vec()),
+        ];
+
+        let fee = calculate_priority_fee_details(
+            &construct_accounts(&account_keys[..])?,
+            &construct_instructions(instructions.to_vec())?,
+            &mut ComputeBudget::default(),
+        )?;
+        assert_eq!(
+            fee.get_fee() as u128,
+            (200_000 * 100_000 + MICRO_LAMPORTS_PER_LAMPORT - 1)
+                / MICRO_LAMPORTS_PER_LAMPORT as u128
+        );
+        assert_eq!(fee.get_priority(), 200_000);
+
+        Ok::<(), anyhow::Error>(())
+    }
+
+    fn construct_instructions(
+        instructions: Vec<(u8, Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<CompiledInstruction>, anyhow::Error> {
+        let res: Result<Vec<CompiledInstruction>, _> = instructions
+            .into_iter()
+            .map(|data| {
+                let (prog_id, operations, accounts) = data;
+                Ok::<CompiledInstruction, anyhow::Error>(CompiledInstruction::new_from_raw_parts(
+                    prog_id, operations, accounts,
+                ))
+            })
+            .collect();
+
+        res.with_context(|| "Failed to parse account keys")
+    }
+
+    fn construct_accounts(account_keys: &[&str]) -> Result<Vec<Pubkey>, anyhow::Error> {
+        let res: Result<Vec<Pubkey>, _> =
+            account_keys.iter().map(|&s| Pubkey::try_from(s)).collect();
+
+        res.with_context(|| "Failed to parse account keys")
     }
 
     fn generate_data() -> Vec<(Vec<Pubkey>, Option<MessageHeader>, Vec<Pubkey>)> {
