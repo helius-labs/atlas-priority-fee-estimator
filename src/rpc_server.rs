@@ -70,6 +70,7 @@ pub struct GetPriorityFeeEstimateOptionsLight {
     pub include_vote: Option<bool>, // include vote txns in the estimate
     // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
     pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
+    pub evaluate_empty_slot_as_zero: Option<bool>, // if true than slots with no transactions will be treated as 0
 }
 
 impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight {
@@ -84,6 +85,7 @@ impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight 
                 lookback_slots: o.lookback_slots,
                 include_vote: o.include_vote,
                 recommended: o.recommended,
+                evaluate_empty_slot_as_zero: o.evaluate_empty_slot_as_zero,
             }
         });
 
@@ -123,6 +125,7 @@ pub struct GetPriorityFeeEstimateOptions {
     pub include_vote: Option<bool>, // include vote txns in the estimate
     // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
     pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
+    pub evaluate_empty_slot_as_zero: Option<bool>, // if true than slots with no transactions will be treated as 0
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -146,6 +149,7 @@ impl Into<GetPriorityFeeEstimateRequestLight> for GetPriorityFeeEstimateRequest 
                 lookback_slots: o.lookback_slots,
                 include_vote: o.include_vote,
                 recommended: o.recommended,
+                evaluate_empty_slot_as_zero: o.evaluate_empty_slot_as_zero,
             }
         });
 
@@ -376,11 +380,13 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         let algo_run_fn = |accounts: Vec<Pubkey>,
                            include_vote: bool,
+                           evaluate_empty_slot_as_zero: bool,
                            lookback_period: Option<u32>|
                            -> MicroLamportPriorityFeeEstimates {
             self.priority_fee_tracker.get_priority_fee_estimates(
                 accounts,
                 include_vote,
+                evaluate_empty_slot_as_zero,
                 lookback_period,
                 true,
             )
@@ -395,11 +401,13 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         let algo_run_fn = |accounts: Vec<Pubkey>,
                            include_vote: bool,
+                           evaluate_empty_slot_as_zero: bool,
                            lookback_period: Option<u32>|
                            -> MicroLamportPriorityFeeEstimates {
             self.priority_fee_tracker.get_priority_fee_estimates(
                 accounts,
                 include_vote,
+                evaluate_empty_slot_as_zero,
                 lookback_period,
                 false,
             )
@@ -425,7 +433,7 @@ impl AtlasPriorityFeeEstimator {
     fn execute_priority_fee_estimate_coordinator(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-        priority_fee_calc_fn: impl FnOnce(Vec<Pubkey>, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates,
+        priority_fee_calc_fn: impl FnOnce(Vec<Pubkey>, bool, bool, Option<u32>) -> MicroLamportPriorityFeeEstimates,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>
     {
         let options = get_priority_fee_estimate_request.options.clone();
@@ -449,7 +457,11 @@ impl AtlasPriorityFeeEstimator {
             }
         }
         let include_vote = should_include_vote(&options);
-        let priority_fee_levels = priority_fee_calc_fn(accounts, include_vote, lookback_slots);
+        let include_empty_slots = should_include_empty_slots(&options);
+        let priority_fee_levels = priority_fee_calc_fn(accounts,
+                                                       include_vote,
+                                                       include_empty_slots,
+                                                       lookback_slots);
         if let Some(options) = options.clone() {
             if options.include_all_priority_fee_levels == Some(true) {
                 return Ok(GetPriorityFeeEstimateResponse {
@@ -494,6 +506,13 @@ fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool 
         return options.include_vote.unwrap_or(false);
     }
     true
+}
+
+fn should_include_empty_slots(options: &Option<GetPriorityFeeEstimateOptions>) -> bool {
+    if let Some(options) = options {
+        return options.evaluate_empty_slot_as_zero.unwrap_or(false);
+    }
+    false
 }
 
 const MIN_RECOMMENDED_PRIORITY_FEE: f64 = 10_000.0;
@@ -671,7 +690,7 @@ mod tests {
             (r#"{"accountkeys": null}"#,"unknown field `accountkeys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 15"),
             (r#"{"accountKeys": [1, 2]}"#, "invalid type: integer `1`, expected a string at line 1 column 19"),
             (r#"{"option": null}"#, "unknown field `option`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 10"),
-            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended` at line 1 column 36"),
+            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended`, `evaluateEmptySlotAsZero` at line 1 column 36"),
             (r#"{"options": {"priorityLevel":"HIGH"}}"#, "unknown variant `HIGH`, expected one of `Min`, `Low`, `Medium`, `High`, `VeryHigh`, `UnsafeMax`, `Default` at line 1 column 36"),
             (r#"{"options": {"includeAllPriorityFeeLevels":"no"}}"#, "invalid type: string \"no\", expected a boolean at line 1 column 48"),
             (r#"{"options": {"lookbackSlots":"no"}}"#,  "invalid type: string \"no\", expected u32 at line 1 column 34"),
