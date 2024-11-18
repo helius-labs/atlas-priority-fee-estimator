@@ -428,6 +428,7 @@ mod tests {
         tracker
             .calculate_priority_fee_details(&calc)
             .expect(format!("estimates for calc1 to be valid with {:?}", calc).as_str())
+            .1
     }
 
     fn calculation2(
@@ -464,6 +465,7 @@ mod tests {
         tracker
             .calculate_priority_fee_details(&calc)
             .expect(format!("estimates for calc2 to be valid with {:?}", calc).as_str())
+            .1
     }
 
     #[tokio::test]
