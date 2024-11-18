@@ -589,10 +589,10 @@ mod tests {
         let resp = result.unwrap();
         let levels = resp.priority_fee_levels.unwrap();
         assert_eq!(levels.min, 100.0);
-        assert_eq!(levels.low, 125.0);
+        assert_eq!(levels.low, 100.0);
         assert_eq!(levels.medium, 150.0);
-        assert_eq!(levels.high, 175.0);
-        assert_eq!(levels.very_high, 195.0);
+        assert_eq!(levels.high, 200.0);
+        assert_eq!(levels.very_high, 200.0);
         assert_eq!(levels.unsafe_max, 200.0);
         assert!(resp.priority_fee_estimate.is_none());
     }

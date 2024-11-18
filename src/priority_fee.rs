@@ -1,6 +1,8 @@
 use crate::errors::TransactionValidationError;
 use crate::grpc_consumer::GrpcConsumer;
-use crate::model::{Fees, MicroLamportPriorityFeeEstimates, PriorityFeesBySlot, SlotPriorityFees};
+use crate::model::{
+    Fees, MicroLamportPriorityFeeEstimates, PriorityFeesBySlot, PriorityLevel, SlotPriorityFees,
+};
 use crate::priority_fee_calculation::Calculations;
 use crate::priority_fee_calculation::Calculations::Calculation1;
 use crate::rpc_server::get_recommended_fee;
@@ -14,6 +16,7 @@ use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::transaction::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
+use statrs::statistics::{Data, OrderStatistics};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::error;
@@ -304,8 +307,44 @@ impl PriorityFeeTracker {
         &self,
         calculation: &Calculations,
     ) -> anyhow::Result<MicroLamportPriorityFeeEstimates> {
-        calculation.get_priority_fee_estimates(&self.priority_fees)
+        let res = calculation.get_priority_fee_estimates(&self.priority_fees)?;
+        let res = res.into_iter().fold(
+            MicroLamportPriorityFeeEstimates::default(),
+            |estimate, mut data| estimate_max_values(&mut data.1, estimate),
+        );
+        Ok(res)
     }
+}
+
+fn estimate_max_values(
+    fees: &mut Data<Vec<f64>>,
+    mut estimates: MicroLamportPriorityFeeEstimates,
+) -> MicroLamportPriorityFeeEstimates {
+    estimates.min = fees
+        .percentile(PriorityLevel::Min.into())
+        .round()
+        .max(estimates.min);
+    estimates.low = fees
+        .percentile(PriorityLevel::Low.into())
+        .round()
+        .max(estimates.low);
+    estimates.medium = fees
+        .percentile(PriorityLevel::Medium.into())
+        .round()
+        .max(estimates.medium);
+    estimates.high = fees
+        .percentile(PriorityLevel::High.into())
+        .round()
+        .max(estimates.high);
+    estimates.very_high = fees
+        .percentile(PriorityLevel::VeryHigh.into())
+        .round()
+        .max(estimates.very_high);
+    estimates.unsafe_max = fees
+        .percentile(PriorityLevel::UnsafeMax.into())
+        .round()
+        .max(estimates.unsafe_max);
+    estimates
 }
 
 #[cfg(test)]
@@ -360,6 +399,180 @@ mod tests {
             .calculate_priority_fee_details(&calc)
             .expect(format!("estimates for calc2 to be valid with {:?}", calc).as_str())
     }
+    #[tokio::test]
+    async fn test_specific_fee_estimates_with_no_account() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let acct = vec![];
+        let estimates = calculation1(&acct, false, false, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(&acct, false, false, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(&acct, false, true, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(&acct, false, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+    }
+
+    #[tokio::test]
+    async fn test_specific_fee_estimates_v2() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        let acct = vec![];
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(&acct, false, false, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(&acct, false, false, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(&acct, false, true, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(&acct, false, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+        // NOTE: calculation 2
+    }
 
     #[tokio::test]
     async fn test_specific_fee_estimates() {
@@ -395,7 +608,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -417,7 +630,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -439,7 +652,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -458,10 +671,10 @@ mod tests {
         );
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -472,7 +685,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_specific_fee_estimates_v2() {
+    async fn test_specific_fee_estimates_with_no_account_v2() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(10);
 
@@ -505,7 +718,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -527,7 +740,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -549,7 +762,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -571,7 +784,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -616,7 +829,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -637,7 +850,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -658,7 +871,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -676,10 +889,10 @@ mod tests {
             &tracker,
         );
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.00;
+        let expected_high_fee = 75.00;
+        let expected_very_high_fee = 96.00;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -723,7 +936,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -744,7 +957,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -765,7 +978,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -786,7 +999,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -838,14 +1051,14 @@ mod tests {
             &None,
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation1(
@@ -855,14 +1068,14 @@ mod tests {
             &Some(150),
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation1(
@@ -872,14 +1085,14 @@ mod tests {
             &None,
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation1(
@@ -889,14 +1102,14 @@ mod tests {
             &Some(150),
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
     }
 
     #[tokio::test]
@@ -943,14 +1156,14 @@ mod tests {
             &None,
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation2(
@@ -960,14 +1173,14 @@ mod tests {
             &Some(150),
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation2(
@@ -977,14 +1190,14 @@ mod tests {
             &None,
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let estimates = calculation2(
@@ -994,14 +1207,14 @@ mod tests {
             &Some(150),
             &tracker,
         );
-        let expected_low_fee = 25.0;
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
     }
 
     #[tokio::test]
@@ -1035,7 +1248,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1050,7 +1263,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1065,7 +1278,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1077,10 +1290,10 @@ mod tests {
         let estimates = calculation1(&v, false, true, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1121,7 +1334,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1136,7 +1349,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1151,7 +1364,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1166,7 +1379,7 @@ mod tests {
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
