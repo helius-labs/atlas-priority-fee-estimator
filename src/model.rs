@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use solana_sdk::clock::Slot;
 use solana_sdk::pubkey::Pubkey;
+use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum PriorityLevel {
@@ -44,6 +45,23 @@ impl Into<Percentile> for PriorityLevel {
 
 pub type Percentile = usize;
 
+#[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
+pub enum DataType<'a> {
+    Global,
+    AllAccounts,
+    Account(&'a Pubkey),
+}
+
+impl Display for DataType<'_> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DataType::Global => f.write_str("Global"),
+            DataType::AllAccounts => f.write_str("All Accounts"),
+            DataType::Account(pubkey) => f.write_str(pubkey.to_string().as_str()),
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone, Default)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
 pub struct MicroLamportPriorityFeeEstimates {
@@ -53,6 +71,16 @@ pub struct MicroLamportPriorityFeeEstimates {
     pub high: f64,
     pub very_high: f64,
     pub unsafe_max: f64,
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone, Default)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
+pub struct MicroLamportPriorityFeeDetails {
+    pub estimates: MicroLamportPriorityFeeEstimates,
+    pub mean: f64,
+    pub stdev: f64,
+    pub skew: f64,
+    pub count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -100,9 +128,17 @@ impl SlotPriorityFees {
             account_fees.insert(account, fees.clone());
         }
         if is_vote {
-            Self { slot, fees, account_fees }
+            Self {
+                slot,
+                fees,
+                account_fees,
+            }
         } else {
-            Self { slot, fees, account_fees }
+            Self {
+                slot,
+                fees,
+                account_fees,
+            }
         }
     }
 }

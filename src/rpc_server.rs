@@ -7,17 +7,19 @@ use std::{
 };
 
 use crate::errors::invalid_request;
-use crate::model::{MicroLamportPriorityFeeEstimates, PriorityLevel};
+use crate::model::{
+    MicroLamportPriorityFeeDetails, MicroLamportPriorityFeeEstimates, PriorityLevel,
+};
 use crate::priority_fee::{construct_writable_accounts, PriorityFeeTracker};
 use crate::priority_fee_calculation::Calculations;
 use crate::solana::solana_rpc::decode_and_deserialize;
 use cadence_macros::{statsd_count, statsd_time};
+use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG};
 use jsonrpsee::{
     core::{async_trait, RpcResult},
     proc_macros::rpc,
     types::ErrorObjectOwned,
 };
-use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG};
 use serde::{Deserialize, Serialize};
 use solana_account_decoder::parse_address_lookup_table::{
     parse_address_lookup_table, LookupTableAccountType,
@@ -130,6 +132,15 @@ pub struct GetPriorityFeeEstimateResponse {
     pub priority_fee_levels: Option<MicroLamportPriorityFeeEstimates>,
 }
 
+#[derive(Serialize, Clone, Debug, Default)]
+#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
+pub struct GetPriorityFeeEstimateDetailsResponse {
+    pub priority_fee_estimate_details: Vec<(String, MicroLamportPriorityFeeDetails)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_fee_estimate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_fee_levels: Option<MicroLamportPriorityFeeEstimates>,
+}
 impl Into<GetPriorityFeeEstimateRequestLight> for GetPriorityFeeEstimateRequest {
     fn into(self) -> GetPriorityFeeEstimateRequestLight {
         let transaction = self.transaction;
@@ -165,6 +176,15 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request)
     }
 
+    // TODO: DKH - delete after all the users were notified about moving to strict parsing
+    #[method(name = "getPriorityFeeEstimateDetails")]
+    fn get_priority_fee_estimate_details_light(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
+        self.get_priority_fee_estimate_details_v1(get_priority_fee_estimate_request)
+    }
+
     // TODO: DKH - rename annotation method name to "getPriorityFeeEstimateStrict" to "getPriorityFeeEstimate"
     #[method(name = "getPriorityFeeEstimateStrict")]
     fn get_priority_fee_estimate(
@@ -194,6 +214,18 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
+
+    #[method(name = "getPriorityFeeEstimateDetailsV1")]
+    fn get_priority_fee_estimate_details_v1(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse>;
+
+    #[method(name = "getPriorityFeeEstimateDetailsV2")]
+    fn get_priority_fee_estimate_details_v2(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse>;
 }
 
 fn validate_get_priority_fee_estimate_request(
@@ -351,7 +383,7 @@ fn get_accounts(
                 get_from_account_keys(&transaction),
                 get_from_address_lookup_tables(rpc_client, &transaction),
             ]
-                .concat();
+            .concat();
             return Ok(account_keys);
         }
     }
@@ -379,6 +411,23 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, false)
+    }
+
+    fn get_priority_fee_estimate_details_v1(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
+        self.execute_priority_fee_details_coordinator(
+            get_priority_fee_estimate_request.into(),
+            true,
+        )
+    }
+
+    fn get_priority_fee_estimate_details_v2(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
+        self.execute_priority_fee_details_coordinator(get_priority_fee_estimate_request, false)
     }
 }
 
@@ -424,16 +473,31 @@ impl AtlasPriorityFeeEstimator {
         let include_vote = should_include_vote(&options);
         let include_empty_slots = should_include_empty_slots(&options);
         let calc = if is_v1 {
-            Calculations::new_calculation1(&accounts, include_vote, include_empty_slots, &lookback_slots)
+            Calculations::new_calculation1(
+                &accounts,
+                include_vote,
+                include_empty_slots,
+                &lookback_slots,
+            )
         } else {
-            Calculations::new_calculation2(&accounts, include_vote, include_empty_slots, &lookback_slots)
+            Calculations::new_calculation2(
+                &accounts,
+                include_vote,
+                include_empty_slots,
+                &lookback_slots,
+            )
         };
-        let priority_fee_levels = self.priority_fee_tracker.calculate_priority_fee_details(&calc);
-        if let Err(e) = priority_fee_levels {
-            warn!("failed to calculate priority_fee_levels: {:#?}", e);
-            return Err(ErrorObjectOwned::owned(INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG, None::<String>));
-        }
-        let priority_fee_levels = priority_fee_levels.unwrap();
+        let priority_fee_levels = match self.priority_fee_tracker.calculate_priority_fee(&calc) {
+            Ok(level) => level,
+            Err(e) => {
+                warn!("failed to calculate priority_fee_levels: {:#?}", e);
+                return Err(ErrorObjectOwned::owned(
+                    INTERNAL_ERROR_CODE,
+                    INTERNAL_ERROR_MSG,
+                    None::<String>,
+                ));
+            }
+        };
         if let Some(options) = options.clone() {
             if options.include_all_priority_fee_levels == Some(true) {
                 return Ok(GetPriorityFeeEstimateResponse {
@@ -466,6 +530,107 @@ impl AtlasPriorityFeeEstimator {
             priority_fee_levels.medium
         };
         Ok(GetPriorityFeeEstimateResponse {
+            priority_fee_estimate: Some(priority_fee),
+            priority_fee_levels: None,
+        })
+    }
+
+    fn execute_priority_fee_details_coordinator(
+        &self,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
+        is_v1: bool,
+    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
+        let options = get_priority_fee_estimate_request.options.clone();
+        let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
+        if let Some(reason) = reason {
+            return Err(reason);
+        }
+        let accounts = get_accounts(&self.rpc_client, get_priority_fee_estimate_request);
+        if let Err(e) = accounts {
+            return Err(e);
+        }
+        let accounts: Vec<Pubkey> = accounts
+            .unwrap()
+            .iter()
+            .filter_map(|a| Pubkey::from_str(a).ok())
+            .collect();
+        let lookback_slots = options.clone().map(|o| o.lookback_slots).flatten();
+        if let Some(lookback_slots) = &lookback_slots {
+            if *lookback_slots < 1 || *lookback_slots as usize > self.max_lookback_slots {
+                return Err(invalid_request("lookback_slots must be between 1 and 150"));
+            }
+        }
+        let include_vote = should_include_vote(&options);
+        let include_empty_slots = should_include_empty_slots(&options);
+        let calc = if is_v1 {
+            Calculations::new_calculation1(
+                &accounts,
+                include_vote,
+                include_empty_slots,
+                &lookback_slots,
+            )
+        } else {
+            Calculations::new_calculation2(
+                &accounts,
+                include_vote,
+                include_empty_slots,
+                &lookback_slots,
+            )
+        };
+        let (total_priority_fee_levels, priority_fee_levels) = match self
+            .priority_fee_tracker
+            .calculate_priority_fee_details(&calc)
+        {
+            Ok(level) => level,
+            Err(e) => {
+                warn!("failed to calculate priority_fee_levels details: {:#?}", e);
+                return Err(ErrorObjectOwned::owned(
+                    INTERNAL_ERROR_CODE,
+                    INTERNAL_ERROR_MSG,
+                    None::<String>,
+                ));
+            }
+        };
+
+        let mut priority_fees: Vec<(String, MicroLamportPriorityFeeDetails)> =
+            priority_fee_levels.into_iter().collect();
+        priority_fees.sort_by(|a, b| b.0.cmp(&a.0));
+
+        if let Some(options) = options.clone() {
+            if options.include_all_priority_fee_levels == Some(true) {
+                return Ok(GetPriorityFeeEstimateDetailsResponse {
+                    priority_fee_estimate_details: priority_fees,
+                    priority_fee_estimate: None,
+                    priority_fee_levels: Some(total_priority_fee_levels),
+                });
+            }
+            if let Some(priority_level) = options.priority_level {
+                let priority_fee = match priority_level {
+                    PriorityLevel::Min => total_priority_fee_levels.min,
+                    PriorityLevel::Low => total_priority_fee_levels.low,
+                    PriorityLevel::Medium => total_priority_fee_levels.medium,
+                    PriorityLevel::High => total_priority_fee_levels.high,
+                    PriorityLevel::VeryHigh => total_priority_fee_levels.very_high,
+                    PriorityLevel::UnsafeMax => total_priority_fee_levels.unsafe_max,
+                    PriorityLevel::Default => total_priority_fee_levels.medium,
+                };
+                return Ok(GetPriorityFeeEstimateDetailsResponse {
+                    priority_fee_estimate_details: priority_fees,
+                    priority_fee_estimate: Some(priority_fee),
+                    priority_fee_levels: None,
+                });
+            }
+        }
+        let recommended = options.map_or(false, |o: GetPriorityFeeEstimateOptions| {
+            o.recommended.unwrap_or(false)
+        });
+        let priority_fee = if recommended {
+            get_recommended_fee(total_priority_fee_levels)
+        } else {
+            total_priority_fee_levels.medium
+        };
+        Ok(GetPriorityFeeEstimateDetailsResponse {
+            priority_fee_estimate_details: priority_fees,
             priority_fee_estimate: Some(priority_fee),
             priority_fee_levels: None,
         })

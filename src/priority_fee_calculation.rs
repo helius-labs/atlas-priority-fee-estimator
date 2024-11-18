@@ -1,18 +1,11 @@
-use crate::model::PriorityFeesBySlot;
-use crate::priority_fee_calculation::Calculations::Calculation1;
+use crate::model::{DataType, PriorityFeesBySlot};
 use cadence_macros::{statsd_count, statsd_gauge};
 use solana_sdk::pubkey::Pubkey;
 use statrs::statistics::Data;
 use std::collections::HashMap;
 use std::time::Instant;
-use Calculations::Calculation2;
+use Calculations::{Calculation1, Calculation2};
 
-#[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
-pub enum DataType<'a> {
-    Global,
-    AllAccounts,
-    Account(&'a Pubkey),
-}
 ///
 /// The result with type of
 ///
