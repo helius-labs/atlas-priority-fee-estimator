@@ -1,126 +1,37 @@
+use crate::errors::TransactionValidationError;
 use crate::grpc_consumer::GrpcConsumer;
+use crate::model::{
+    Fees, MicroLamportPriorityFeeDetails, MicroLamportPriorityFeeEstimates, PriorityFeesBySlot,
+    PriorityLevel, SlotPriorityFees,
+};
+use crate::priority_fee_calculation::Calculations;
+use crate::priority_fee_calculation::Calculations::Calculation1;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
 use dashmap::DashMap;
-use serde::Deserialize;
-use serde::Serialize;
 use solana::storage::confirmed_block::Message;
 use solana_program_runtime::compute_budget::ComputeBudget;
 use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
 use solana_sdk::instruction::CompiledInstruction;
 use solana_sdk::transaction::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
+use statrs::statistics::{Data, Distribution, OrderStatistics};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tracing::{debug, error};
+use std::time::Duration;
+use tracing::error;
 use yellowstone_grpc_proto::geyser::subscribe_update::UpdateOneof;
 use yellowstone_grpc_proto::geyser::{SubscribeUpdate, SubscribeUpdateTransactionInfo};
 use yellowstone_grpc_proto::prelude::{MessageHeader, Transaction, TransactionStatusMeta};
 use yellowstone_grpc_proto::solana;
-
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
-pub enum PriorityLevel {
-    Min,       // 0th percentile
-    Low,       // 25th percentile
-    Medium,    // 50th percentile
-    High,      // 75th percentile
-    VeryHigh,  // 95th percentile
-    UnsafeMax, // 100th percentile
-    Default,   // 50th percentile
-}
-
-impl From<String> for PriorityLevel {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "NONE" => PriorityLevel::Min,
-            "LOW" => PriorityLevel::Low,
-            "MEDIUM" => PriorityLevel::Medium,
-            "HIGH" => PriorityLevel::High,
-            "VERY_HIGH" => PriorityLevel::VeryHigh,
-            "UNSAFE_MAX" => PriorityLevel::UnsafeMax,
-            _ => PriorityLevel::Default,
-        }
-    }
-}
-
-impl Into<Percentile> for PriorityLevel {
-    fn into(self) -> Percentile {
-        match self {
-            PriorityLevel::Min => 0,
-            PriorityLevel::Low => 25,
-            PriorityLevel::Medium => 50,
-            PriorityLevel::High => 75,
-            PriorityLevel::VeryHigh => 95,
-            PriorityLevel::UnsafeMax => 100,
-            PriorityLevel::Default => 50,
-        }
-    }
-}
-
-type Percentile = usize;
-
-#[derive(Deserialize, Serialize, Debug, Clone, Default)]
-#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-pub struct MicroLamportPriorityFeeEstimates {
-    pub min: f64,
-    pub low: f64,
-    pub medium: f64,
-    pub high: f64,
-    pub very_high: f64,
-    pub unsafe_max: f64,
-}
-
-#[derive(Debug, Clone)]
-struct SlotPriorityFees {
-    fees: Fees,
-    account_fees: DashMap<Pubkey, Fees>,
-}
-type PriorityFeesBySlot = DashMap<Slot, SlotPriorityFees>;
-
-impl SlotPriorityFees {
-    fn new(accounts: Vec<Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
-        let account_fees = DashMap::new();
-        let fees = Fees::new(priority_fee as f64, is_vote);
-        for account in accounts {
-            account_fees.insert(account, fees.clone());
-        }
-        if is_vote {
-            Self { fees, account_fees }
-        } else {
-            Self { fees, account_fees }
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct PriorityFeeTracker {
     priority_fees: Arc<PriorityFeesBySlot>,
     compute_budget: ComputeBudget,
     slot_cache: SlotCache,
-    sampling_sender: Sender<(Vec<Pubkey>, bool, bool, Option<u32>)>,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq)]
-enum TransactionValidationError {
-    TransactionFailed,
-    TransactionMissing,
-    MessageMissing,
-    InvalidAccount,
-}
-
-impl Into<&str> for TransactionValidationError {
-    fn into(self) -> &'static str {
-        match self {
-            TransactionValidationError::TransactionFailed => "txn_failed",
-            TransactionValidationError::TransactionMissing => "txn_missing",
-            TransactionValidationError::MessageMissing => "message_missing",
-            TransactionValidationError::InvalidAccount => "invalid_pubkey",
-        }
-    }
 }
 
 fn extract_from_meta(
@@ -159,7 +70,7 @@ fn extract_from_transaction(
         .ok_or(TransactionValidationError::MessageMissing)?;
     let is_vote = transaction.is_vote;
 
-    Result::Ok((message, writable_accounts, is_vote))
+    Ok((message, writable_accounts, is_vote))
 }
 
 fn extract_from_message(
@@ -299,199 +210,66 @@ impl GrpcConsumer for PriorityFeeTracker {
 
 impl PriorityFeeTracker {
     pub fn new(slot_cache_length: usize) -> Self {
-        let (sampling_txn, sampling_rxn) = channel::<(Vec<Pubkey>, bool, bool, Option<u32>)>(100);
-
         let tracker = Self {
             priority_fees: Arc::new(DashMap::new()),
             slot_cache: SlotCache::new(slot_cache_length),
             compute_budget: ComputeBudget::default(),
-            sampling_sender: sampling_txn,
         };
-        tracker.poll_fees(sampling_rxn);
+        tracker.poll_fees();
         tracker
     }
 
-    fn poll_fees(&self, mut sampling_rxn: Receiver<(Vec<Pubkey>, bool, bool, Option<u32>)>) {
-        {
-            let priority_fee_tracker = self.clone();
-            // task to run global fee comparison every 1 second
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(Duration::from_millis(1_000)).await;
-                    priority_fee_tracker.record_general_fees();
-                }
-            });
-        }
-
-        {
-            let priority_fee_tracker = self.clone();
-            // task to poll the queue and run comparison to see what is the diff between algos
-            tokio::spawn(async move {
-                loop {
-                    match sampling_rxn.recv().await {
-                        Some((accounts, include_vote, include_empty_slots, lookback_period)) => priority_fee_tracker
-                            .record_specific_fees(accounts, include_vote, include_empty_slots, lookback_period),
-                        _ => {}
-                    }
-                }
-            });
-        }
+    fn poll_fees(&self) {
+        let priority_fee_tracker = self.clone();
+        // task to run global fee comparison every 1 second
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(1_000)).await;
+                priority_fee_tracker.record_general_fees();
+            }
+        });
     }
 
     fn record_general_fees(&self) {
-        let global_fees = self.calculation1(&vec![], false, false, &None);
-        statsd_gauge!(
-            "min_priority_fee",
-            global_fees.min as u64,
-            "account" => "none"
-        );
-        statsd_gauge!("low_priority_fee", global_fees.low as u64, "account" => "none");
-        statsd_gauge!(
-            "medium_priority_fee",
-            global_fees.medium as u64,
-            "account" => "none"
-        );
-        statsd_gauge!(
-            "high_priority_fee",
-            global_fees.high as u64,
-            "account" => "none"
-        );
-        statsd_gauge!(
-            "very_high_priority_fee",
-            global_fees.very_high as u64,
-            "account" => "none"
-        );
-        statsd_gauge!(
-            "unsafe_max_priority_fee",
-            global_fees.unsafe_max as u64,
-            "account" => "none"
-        );
-        statsd_gauge!(
-            "recommended_priority_fee",
-            get_recommended_fee(global_fees) as u64,
-            "account" => "none"
-        );
-    }
-
-    fn record_specific_fees(
-        &self,
-        accounts: Vec<Pubkey>,
-        include_vote: bool,
-        include_empty_slots: bool,
-        lookback_period: Option<u32>,
-    ) {
-        let old_fee = self.calculation1(&accounts, include_vote, include_empty_slots, &lookback_period);
-        let new_fee = self.calculation2(&accounts, include_vote, include_empty_slots, &lookback_period);
-        let new_fee_last = self.calculation2(&accounts, include_vote, include_empty_slots, &Some(1));
-
-        statsd_gauge!(
-            "min_priority_fee",
-            old_fee.min,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "min_priority_fee_new",
-            new_fee.min,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "min_priority_fee_last",
-            new_fee_last.min,
-            "account" => "spec"
-        );
-
-        statsd_gauge!("low_priority_fee",
-            old_fee.low,
-            "account" => "spec"
-        );
-        statsd_gauge!("low_priority_fee_new",
-            new_fee.low,
-            "account" => "spec"
-        );
-        statsd_gauge!("low_priority_fee_last",
-            new_fee_last.low,
-            "account" => "spec"
-        );
-
-        statsd_gauge!(
-            "medium_priority_fee",
-            old_fee.medium,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "medium_priority_fee_new",
-            new_fee.medium,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "medium_priority_fee_last",
-            new_fee_last.medium,
-            "account" => "spec"
-        );
-
-        statsd_gauge!(
-            "high_priority_fee",
-            old_fee.high,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "high_priority_fee_new",
-            new_fee.high,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "high_priority_fee_last",
-            new_fee_last.high,
-            "account" => "spec"
-        );
-
-        statsd_gauge!(
-            "very_high_priority_fee",
-            old_fee.very_high,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "very_high_priority_fee_new",
-            new_fee.very_high,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "very_high_priority_fee_last",
-            new_fee_last.very_high,
-            "account" => "spec"
-        );
-
-        statsd_gauge!(
-            "unsafe_max_priority_fee",
-            old_fee.unsafe_max,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "unsafe_max_priority_fee_new",
-            new_fee.unsafe_max,
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "very_high_priority_fee_last",
-            new_fee_last.unsafe_max,
-            "account" => "spec"
-        );
-
-        statsd_gauge!(
-            "recommended_priority_fee",
-            get_recommended_fee(old_fee),
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "recommended_priority_fee_new",
-            get_recommended_fee(new_fee),
-            "account" => "spec"
-        );
-        statsd_gauge!(
-            "recommended_priority_fee_last",
-            get_recommended_fee(new_fee_last),
-            "account" => "spec"
-        );
+        let global_fees = self.calculate_priority_fee(&Calculation1 {
+            accounts: &vec![],
+            include_vote: false,
+            include_empty_slots: false,
+            lookback_period: &None,
+        });
+        if let Ok(global_fees) = global_fees {
+            statsd_gauge!(
+                "min_priority_fee",
+                global_fees.min as u64,
+                "account" => "none"
+            );
+            statsd_gauge!("low_priority_fee", global_fees.low as u64, "account" => "none");
+            statsd_gauge!(
+                "medium_priority_fee",
+                global_fees.medium as u64,
+                "account" => "none"
+            );
+            statsd_gauge!(
+                "high_priority_fee",
+                global_fees.high as u64,
+                "account" => "none"
+            );
+            statsd_gauge!(
+                "very_high_priority_fee",
+                global_fees.very_high as u64,
+                "account" => "none"
+            );
+            statsd_gauge!(
+                "unsafe_max_priority_fee",
+                global_fees.unsafe_max as u64,
+                "account" => "none"
+            );
+            statsd_gauge!(
+                "recommended_priority_fee",
+                get_recommended_fee(global_fees) as u64,
+                "account" => "none"
+            );
+        }
     }
 
     pub fn push_priority_fee_for_txn(
@@ -505,8 +283,10 @@ impl PriorityFeeTracker {
         // for removal later
         let slot_to_remove = self.slot_cache.push_pop(slot);
         if !self.priority_fees.contains_key(&slot) {
-            self.priority_fees
-                .insert(slot, SlotPriorityFees::new(accounts, priority_fee, is_vote));
+            self.priority_fees.insert(
+                slot,
+                SlotPriorityFees::new(slot, accounts, priority_fee, is_vote),
+            );
         } else {
             // update the slot priority fees
             self.priority_fees.entry(slot).and_modify(|priority_fees| {
@@ -525,297 +305,76 @@ impl PriorityFeeTracker {
         }
     }
 
-    // TODO: DKH - both algos should probably be in some enum (like algo1, algo2) and be passed to
-    // this method instead of sending a bool flag. I'll refactor this in next iteration. already too many changes
-    pub fn get_priority_fee_estimates(
+    pub fn calculate_priority_fee(
         &self,
-        accounts: Vec<Pubkey>,
-        include_vote: bool,
-        include_empty_slots: bool,
-        lookback_period: Option<u32>,
-        calculation1: bool,
-    ) -> MicroLamportPriorityFeeEstimates {
-        let start = Instant::now();
-        let micro_lamport_priority_fee_estimates = if calculation1 {
-            self.calculation1(&accounts, include_vote, include_empty_slots, &lookback_period)
-        } else {
-            self.calculation2(&accounts, include_vote, include_empty_slots, &lookback_period)
-        };
-
-        let version = if calculation1 { "v1" } else { "v2" };
-        statsd_gauge!(
-            "get_priority_fee_estimates_time",
-            start.elapsed().as_nanos() as u64,
-            "version" => &version
+        calculation: &Calculations,
+    ) -> anyhow::Result<MicroLamportPriorityFeeEstimates> {
+        let res = calculation.get_priority_fee_estimates(&self.priority_fees)?;
+        let res = res.into_iter().fold(
+            MicroLamportPriorityFeeEstimates::default(),
+            |estimate, mut data| estimate_max_values(&mut data.1, estimate),
         );
-        statsd_count!(
-            "get_priority_fee_calculation_version",
-            1,
-            "version" => &version
-        );
-        if let Err(e) = self.sampling_sender.try_send((
-            accounts.to_owned(),
-            include_vote,
-            include_empty_slots,
-            lookback_period.to_owned(),
-        )) {
-            debug!("Did not add sample for calculation, {:?}", e);
-        }
-
-        micro_lamport_priority_fee_estimates
+        Ok(res)
     }
 
-    /*
-    Algo1: given the list of accounts the algorithm will:
-     1. collect all the transactions fees over n slots
-     2. collect all the transaction fees for all the accounts specified over n slots
-     3. will calculate the percentile distributions for each of two groups
-     4. will choose the highest value from each percentile between two groups
-     */
-    fn calculation1(
+    pub fn calculate_priority_fee_details(
         &self,
-        accounts: &Vec<Pubkey>,
-        include_vote: bool,
-        include_empty_slots: bool,
-        lookback_period: &Option<u32>,
-    ) -> MicroLamportPriorityFeeEstimates {
-        let mut account_fees = vec![];
-        let mut transaction_fees = vec![];
-        for (i, slot_priority_fees) in self.priority_fees.iter().enumerate() {
-            if let Some(lookback_period) = lookback_period {
-                if i >= *lookback_period as usize {
-                    break;
-                }
-            }
-            if include_vote {
-                transaction_fees.extend_from_slice(&slot_priority_fees.fees.vote_fees);
-            }
-            transaction_fees.extend_from_slice(&slot_priority_fees.fees.non_vote_fees);
-            for account in accounts {
-                let account_priority_fees = slot_priority_fees.account_fees.get(account);
-                if let Some(account_priority_fees) = account_priority_fees {
-                    if include_vote {
-                        account_fees.extend_from_slice(&account_priority_fees.vote_fees);
-                    }
-                    account_fees.extend_from_slice(&account_priority_fees.non_vote_fees);
-                }
-            }
-        }
-        if include_empty_slots {
-            let lookback = lookback_period.map(|v| v as usize).unwrap_or(self.priority_fees.len());
-            let account_max_size = account_fees.len().max(lookback);
-            let transaction_max_size = transaction_fees.len().max(lookback);
-            // if there are less data than number of slots - append 0s for up to number of slots so we don't overestimate the values
-            account_fees.resize(account_max_size, 0f64);
-            transaction_fees.resize(transaction_max_size, 0f64);
-        }
-
-        let micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates {
-            min: max_percentile(&mut account_fees, &mut transaction_fees, 0),
-            low: max_percentile(&mut account_fees, &mut transaction_fees, 25),
-            medium: max_percentile(&mut account_fees, &mut transaction_fees, 50),
-            high: max_percentile(&mut account_fees, &mut transaction_fees, 75),
-            very_high: max_percentile(&mut account_fees, &mut transaction_fees, 95),
-            unsafe_max: max_percentile(&mut account_fees, &mut transaction_fees, 100),
-        };
-
-        micro_lamport_priority_fee_estimates
-    }
-
-    /*
-    Algo2: given the list of accounts the algorithm will:
-     1. collect all the transactions fees over n slots
-     2. for each specified account collect the fees and calculate the percentiles
-     4. choose maximum values for each percentile between all transactions and each account
-     */
-    fn calculation2(
-        &self,
-        accounts: &Vec<Pubkey>,
-        include_vote: bool,
-        include_empty_slots: bool,
-        lookback_period: &Option<u32>,
-    ) -> MicroLamportPriorityFeeEstimates {
-        let mut slots_vec = Vec::with_capacity(self.slot_cache.len());
-        self.slot_cache.copy_slots(&mut slots_vec);
-        slots_vec.sort();
-        slots_vec.reverse();
-
-        let slots_vec = slots_vec;
-
-        let lookback = calculate_lookback_size(&lookback_period, slots_vec.len());
-
-        let mut fees = Vec::with_capacity(slots_vec.len());
-        let mut micro_lamport_priority_fee_estimates = MicroLamportPriorityFeeEstimates::default();
-
-        for slot in &slots_vec[..lookback] {
-            if let Some(slot_priority_fees) = self.priority_fees.get(slot) {
-                if include_vote {
-                    fees.extend_from_slice(&slot_priority_fees.fees.vote_fees);
-                }
-                fees.extend_from_slice(&slot_priority_fees.fees.non_vote_fees);
-            }
-        }
-        micro_lamport_priority_fee_estimates =
-            estimate_max_values(&mut fees, micro_lamport_priority_fee_estimates);
-
-        for account in accounts {
-            fees.clear();
-            let mut zero_slots: usize = 0;
-            for slot in &slots_vec[..lookback] {
-                if let Some(slot_priority_fees) = self.priority_fees.get(slot) {
-                    let account_priority_fees = slot_priority_fees.account_fees.get(account);
-                    if let Some(account_priority_fees) = account_priority_fees {
-                        if include_vote {
-                            fees.extend_from_slice(&account_priority_fees.vote_fees);
-                        }
-                        fees.extend_from_slice(&account_priority_fees.non_vote_fees);
-                    }
-                    else {
-                        zero_slots += 1;
-                    }
-                }
-                else {
-                    zero_slots += 1;
-                }
-            }
-            if include_empty_slots {
-                // for all empty slot we need to add a 0
-                fees.resize(fees.len() + zero_slots, 0f64);
-            }
-            micro_lamport_priority_fee_estimates =
-                estimate_max_values(&mut fees, micro_lamport_priority_fee_estimates);
-        }
-        micro_lamport_priority_fee_estimates
+        calculation: &Calculations,
+    ) -> anyhow::Result<(MicroLamportPriorityFeeEstimates, HashMap<String, MicroLamportPriorityFeeDetails>)> {
+        let data = calculation.get_priority_fee_estimates(&self.priority_fees)?;
+        let final_result: MicroLamportPriorityFeeEstimates = data.clone().into_iter().fold(
+            MicroLamportPriorityFeeEstimates::default(),
+            |estimate, mut data| estimate_max_values(&mut data.1, estimate),
+        );
+        let results: HashMap<String, MicroLamportPriorityFeeDetails> = data
+            .into_iter()
+            .map(|mut data| {
+                let estimate = MicroLamportPriorityFeeDetails {
+                    estimates: estimate_max_values(
+                        &mut data.1,
+                        MicroLamportPriorityFeeEstimates::default(),
+                    ),
+                    mean: data.1.mean().unwrap_or(f64::NAN).round(),
+                    stdev: data.1.std_dev().unwrap_or(f64::NAN).round(),
+                    skew: data.1.skewness().unwrap_or(f64::NAN).round(),
+                    count: data.1.len(),
+                };
+                (data.0.to_string(), estimate)
+            })
+            .collect();
+        Ok((final_result, results))
     }
 }
 
 fn estimate_max_values(
-    mut fees: &mut Vec<f64>,
+    fees: &mut Data<Vec<f64>>,
     mut estimates: MicroLamportPriorityFeeEstimates,
 ) -> MicroLamportPriorityFeeEstimates {
-    let vals: HashMap<Percentile, f64> = percentile(
-        &mut fees,
-        &[
-            PriorityLevel::Min.into(),
-            PriorityLevel::Low.into(),
-            PriorityLevel::Medium.into(),
-            PriorityLevel::High.into(),
-            PriorityLevel::VeryHigh.into(),
-            PriorityLevel::UnsafeMax.into(),
-        ],
-    );
-    estimates.min = vals
-        .get(&PriorityLevel::Min.into())
-        .unwrap_or(&estimates.min)
+    estimates.min = fees
+        .percentile(PriorityLevel::Min.into())
+        .round()
         .max(estimates.min);
-    estimates.low = vals
-        .get(&PriorityLevel::Low.into())
-        .unwrap_or(&estimates.low)
+    estimates.low = fees
+        .percentile(PriorityLevel::Low.into())
+        .round()
         .max(estimates.low);
-    estimates.medium = vals
-        .get(&PriorityLevel::Medium.into())
-        .unwrap_or(&estimates.medium)
+    estimates.medium = fees
+        .percentile(PriorityLevel::Medium.into())
+        .round()
         .max(estimates.medium);
-    estimates.high = vals
-        .get(&PriorityLevel::High.into())
-        .unwrap_or(&estimates.high)
+    estimates.high = fees
+        .percentile(PriorityLevel::High.into())
+        .round()
         .max(estimates.high);
-    estimates.very_high = vals
-        .get(&PriorityLevel::VeryHigh.into())
-        .unwrap_or(&estimates.very_high)
+    estimates.very_high = fees
+        .percentile(PriorityLevel::VeryHigh.into())
+        .round()
         .max(estimates.very_high);
-    estimates.unsafe_max = vals
-        .get(&PriorityLevel::UnsafeMax.into())
-        .unwrap_or(&estimates.unsafe_max)
+    estimates.unsafe_max = fees
+        .percentile(PriorityLevel::UnsafeMax.into())
+        .round()
         .max(estimates.unsafe_max);
     estimates
-}
-
-fn max(a: f64, b: f64) -> f64 {
-    if a > b {
-        a
-    } else {
-        b
-    }
-}
-
-fn calculate_lookback_size(pref_num_slots: &Option<u32>, max_available_slots: usize) -> usize {
-    max_available_slots.min(
-        pref_num_slots
-            .map(|v| v as usize)
-            .unwrap_or(max_available_slots),
-    )
-}
-
-#[derive(Debug, Clone)]
-pub struct Fees {
-    non_vote_fees: Vec<f64>,
-    vote_fees: Vec<f64>,
-}
-
-impl Fees {
-    pub fn new(fee: f64, is_vote: bool) -> Self {
-        if is_vote {
-            Self {
-                vote_fees: vec![fee],
-                non_vote_fees: vec![],
-            }
-        } else {
-            Self {
-                vote_fees: vec![],
-                non_vote_fees: vec![fee],
-            }
-        }
-    }
-
-    pub fn add_fee(&mut self, fee: f64, is_vote: bool) {
-        if is_vote {
-            self.vote_fees.push(fee);
-        } else {
-            self.non_vote_fees.push(fee);
-        }
-    }
-}
-
-fn max_percentile(
-    account_fees: &mut Vec<f64>,
-    transaction_fees: &mut Vec<f64>,
-    percentile_value: Percentile,
-) -> f64 {
-    let results1 = percentile(account_fees, &[percentile_value]);
-    let results2 = percentile(transaction_fees, &[percentile_value]);
-    max(
-        *results1.get(&percentile_value).unwrap_or(&0f64),
-        *results2.get(&percentile_value).unwrap_or(&0f64),
-    )
-}
-
-// pulled from here - https://www.calculatorsoup.com/calculators/statistics/percentile-calculator.php
-// couldn't find any good libraries that worked
-fn percentile(values: &mut Vec<f64>, percentiles: &[Percentile]) -> HashMap<Percentile, f64> {
-    if values.is_empty() {
-        return HashMap::with_capacity(0);
-    }
-
-    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let n = values.len() as f64;
-
-    percentiles.into_iter().fold(
-        HashMap::with_capacity(percentiles.len()),
-        |mut data, &percentile| {
-            let r = (percentile as f64 / 100.0) * (n - 1.0) + 1.0;
-
-            let val = if r.fract() == 0.0 {
-                values[r as usize - 1]
-            } else {
-                let ri = r.trunc() as usize - 1;
-                let rf = r.fract();
-                values[ri] + rf * (values[ri + 1] - values[ri])
-            };
-            data.insert(percentile, val);
-            data
-        },
-    )
 }
 
 #[cfg(test)]
@@ -835,8 +394,82 @@ mod tests {
         set_global_default(client)
     }
 
+    fn calculation1(
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        include_empty_slot: bool,
+        lookback_period: &Option<u32>,
+        tracker: &PriorityFeeTracker,
+    ) -> MicroLamportPriorityFeeEstimates {
+        let calc = Calculations::new_calculation1(
+            accounts,
+            include_vote,
+            include_empty_slot,
+            lookback_period,
+        );
+        tracker
+            .calculate_priority_fee(&calc)
+            .expect(format!("estimates for calc1 to be valid with {:?}", calc).as_str())
+    }
+
+    fn calculation_details_1(
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        include_empty_slot: bool,
+        lookback_period: &Option<u32>,
+        tracker: &PriorityFeeTracker,
+    ) -> HashMap<String, MicroLamportPriorityFeeDetails> {
+        let calc = Calculations::new_calculation1(
+            accounts,
+            include_vote,
+            include_empty_slot,
+            lookback_period,
+        );
+        tracker
+            .calculate_priority_fee_details(&calc)
+            .expect(format!("estimates for calc1 to be valid with {:?}", calc).as_str())
+            .1
+    }
+
+    fn calculation2(
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        include_empty_slot: bool,
+        lookback_period: &Option<u32>,
+        tracker: &PriorityFeeTracker,
+    ) -> MicroLamportPriorityFeeEstimates {
+        let calc = Calculations::new_calculation2(
+            accounts,
+            include_vote,
+            include_empty_slot,
+            lookback_period,
+        );
+        tracker
+            .calculate_priority_fee(&calc)
+            .expect(format!("estimates for calc2 to be valid with {:?}", calc).as_str())
+    }
+
+    fn calculation_details_2(
+        accounts: &Vec<Pubkey>,
+        include_vote: bool,
+        include_empty_slot: bool,
+        lookback_period: &Option<u32>,
+        tracker: &PriorityFeeTracker,
+    ) -> HashMap<String, MicroLamportPriorityFeeDetails> {
+        let calc = Calculations::new_calculation2(
+            accounts,
+            include_vote,
+            include_empty_slot,
+            lookback_period,
+        );
+        tracker
+            .calculate_priority_fee_details(&calc)
+            .expect(format!("estimates for calc2 to be valid with {:?}", calc).as_str())
+            .1
+    }
+
     #[tokio::test]
-    async fn test_specific_fee_estimates() {
+    async fn test_specific_fee_estimates_with_no_account() {
         init_metrics();
         let tracker = PriorityFeeTracker::new(10);
 
@@ -857,30 +490,14 @@ mod tests {
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false, &None);
+        let acct = vec![];
+        let estimates = calculation1(&acct, false, false, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        let expected_max_fee = 100.0;
-        assert_eq!(estimates.min, expected_min_fee);
-        assert_eq!(estimates.low, expected_low_fee);
-        assert_eq!(estimates.medium, expected_medium_fee);
-        assert_eq!(estimates.high, expected_high_fee);
-        assert_eq!(estimates.very_high, expected_very_high_fee);
-        assert_eq!(estimates.unsafe_max, expected_max_fee);
-
-
-        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false, &Some(150));
-        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
-        let expected_min_fee = 0.0;
-        let expected_low_fee = 25.0;
-        let expected_medium_fee = 50.0;
-        let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -890,13 +507,13 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true, &None);
+        let estimates = calculation1(&acct, false, true, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -905,15 +522,30 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true, &Some(150));
+        let estimates = calculation1(&acct, false, true, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(&acct, true, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -944,31 +576,15 @@ mod tests {
             tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
         }
 
+        let acct = vec![];
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false, &None);
+        let estimates = calculation2(&acct, false, false, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        let expected_max_fee = 100.0;
-        assert_eq!(estimates.min, expected_min_fee);
-        assert_eq!(estimates.low, expected_low_fee);
-        assert_eq!(estimates.medium, expected_medium_fee);
-        assert_eq!(estimates.high, expected_high_fee);
-        assert_eq!(estimates.very_high, expected_very_high_fee);
-        assert_eq!(estimates.unsafe_max, expected_max_fee);
-
-
-        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false, &Some(150));
-        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
-        let expected_min_fee = 0.0;
-        let expected_low_fee = 25.0;
-        let expected_medium_fee = 50.0;
-        let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -978,13 +594,13 @@ mod tests {
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true, &None);
+        let estimates = calculation2(&acct, false, false, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -993,15 +609,435 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true, &Some(150));
+        let estimates = calculation2(&acct, false, true, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(&acct, false, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+        // NOTE: calculation 2
+    }
+
+    #[tokio::test]
+    async fn test_specific_fee_estimates_details_with_no_account() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let acct = vec![];
+        let estimates = calculation_details_1(&acct, false, false, &None, &tracker);
+        assert_eq!(estimates.len(), 2);
+
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.low, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.medium, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.very_high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.unsafe_max, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().count, 0);
+        assert!(estimates.get("All Accounts").unwrap().mean.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().stdev.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().skew.is_nan());
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_1(&acct, false, true, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.low, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.medium, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.very_high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.unsafe_max, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().count, 0);
+        assert!(estimates.get("All Accounts").unwrap().mean.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().stdev.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().skew.is_nan());
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_1(&acct, false, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.low, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.medium, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.very_high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.unsafe_max, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().count, 0);
+        assert!(estimates.get("All Accounts").unwrap().mean.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().stdev.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().skew.is_nan());
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_1(&acct, true, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.low, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.medium, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.very_high, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().estimates.unsafe_max, 0.0);
+        assert_eq!(estimates.get("All Accounts").unwrap().count, 0);
+        assert!(estimates.get("All Accounts").unwrap().mean.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().stdev.is_nan());
+        assert!(estimates.get("All Accounts").unwrap().skew.is_nan());
+    }
+
+    #[tokio::test]
+    async fn test_specific_fee_estimates_detail_v2() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        let acct = vec![];
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_2(&acct, false, false, &None, &tracker);
+        assert_eq!(estimates.len(), 1);
+
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_2(&acct, false, false, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_2(&acct, false, true, &None, &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation_details_2(&acct, false, true, &Some(150), &tracker);
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.get("Global").unwrap().estimates.min, 0.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.low, 25.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.medium, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.high, 75.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.very_high, 96.0);
+        assert_eq!(estimates.get("Global").unwrap().estimates.unsafe_max, 100.0);
+        assert_eq!(estimates.get("Global").unwrap().count, 101);
+        assert_eq!(estimates.get("Global").unwrap().mean, 50.0);
+        assert_eq!(estimates.get("Global").unwrap().stdev, 29.0);
+        assert!(estimates.get("Global").unwrap().skew.is_nan());
+        // NOTE: calculation 2
+    }
+
+    #[tokio::test]
+    async fn test_specific_fee_estimates() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.min, 0.0);
+        assert_eq!(estimates.low, 25.0);
+        assert_eq!(estimates.medium, 50.0);
+        assert_eq!(estimates.high, 75.0);
+        assert_eq!(estimates.very_high, 96.0);
+        assert_eq!(estimates.unsafe_max, 100.0);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.min, 0.0);
+        assert_eq!(estimates.low, 25.0);
+        assert_eq!(estimates.medium, 50.0);
+        assert_eq!(estimates.high, 75.0);
+        assert_eq!(estimates.very_high, 96.0);
+        assert_eq!(estimates.unsafe_max, 100.0);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.min, 0.0);
+        assert_eq!(estimates.low, 25.0);
+        assert_eq!(estimates.medium, 50.0);
+        assert_eq!(estimates.high, 75.0);
+        assert_eq!(estimates.very_high, 96.0);
+        assert_eq!(estimates.unsafe_max, 100.0);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        assert_eq!(estimates.min, 0.0);
+        assert_eq!(estimates.low, 25.0);
+        assert_eq!(estimates.medium, 50.0);
+        assert_eq!(estimates.high, 75.0);
+        assert_eq!(estimates.very_high, 96.0);
+        assert_eq!(estimates.unsafe_max, 100.0);
+    }
+
+    #[tokio::test]
+    async fn test_specific_fee_estimates_with_no_account_v2() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(10);
+
+        let mut fees = vec![];
+        let mut i = 0;
+        while i <= 100 {
+            fees.push(i as f64);
+            i += 1;
+        }
+        let account_1 = Pubkey::new_unique();
+        let account_2 = Pubkey::new_unique();
+        let account_3 = Pubkey::new_unique();
+        let accounts = vec![account_1, account_2, account_3];
+
+        // Simulate adding the fixed fees as both account-specific and transaction fees
+        for fee in fees.clone() {
+            tracker.push_priority_fee_for_txn(1, accounts.clone(), fee as u64, false);
+        }
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
+        let expected_max_fee = 100.0;
+        assert_eq!(estimates.min, expected_min_fee);
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
+        assert_eq!(estimates.unsafe_max, expected_max_fee);
+
+        // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
+        // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
+        let expected_min_fee = 0.0;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1035,12 +1071,18 @@ mod tests {
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false,  &None);
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1049,14 +1091,19 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false,  &Some(150));
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1065,14 +1112,19 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true,  &None);
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1081,14 +1133,19 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true,  &Some(150));
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.00;
+        let expected_high_fee = 75.00;
+        let expected_very_high_fee = 96.00;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1121,12 +1178,18 @@ mod tests {
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false,  &None);
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1134,15 +1197,20 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false,  &Some(150));
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1150,15 +1218,20 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true,  &None);
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1166,15 +1239,20 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true,  &Some(150));
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1182,7 +1260,6 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
     }
 
     #[tokio::test]
@@ -1208,58 +1285,85 @@ mod tests {
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
             if 0 == i.rem_euclid(10usize) {
-                tracker.push_priority_fee_for_txn(i as Slot, vec![account_unrelated], fee as u64, false);
-            }
-            else {
+                tracker.push_priority_fee_for_txn(
+                    i as Slot,
+                    vec![account_unrelated],
+                    fee as u64,
+                    false,
+                );
+            } else {
                 tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
             }
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false, &None);
-        let expected_low_fee = 25.0;
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, false, &Some(150));
-        let expected_low_fee = 25.0;
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true, &None);
-        let expected_low_fee = 25.0;
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation1(&vec![accounts.get(0).unwrap().clone()], false, true, &Some(150));
-        let expected_low_fee = 25.0;
+        let estimates = calculation1(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
     }
-
 
     #[tokio::test]
     async fn test_with_many_slots_broken_v2() {
@@ -1286,57 +1390,84 @@ mod tests {
         // Simulate adding the fixed fees as both account-specific and transaction fees
         for (i, fee) in fees.clone().into_iter().enumerate() {
             if 0 == i.rem_euclid(10usize) {
-                tracker.push_priority_fee_for_txn(i as Slot, vec![account_unrelated], fee as u64, false);
-            }
-            else {
+                tracker.push_priority_fee_for_txn(
+                    i as Slot,
+                    vec![account_unrelated],
+                    fee as u64,
+                    false,
+                );
+            } else {
                 tracker.push_priority_fee_for_txn(i as Slot, accounts.clone(), fee as u64, false);
             }
         }
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false, &None);
-        let expected_low_fee = 25.0;
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &None,
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, false, &Some(150));
-        let expected_low_fee = 25.0;
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            false,
+            &Some(150),
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true, &None);
-        let expected_low_fee = 25.0;
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &None,
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
-        let estimates = tracker.calculation2(&vec![accounts.get(0).unwrap().clone()], false, true, &Some(150));
-        let expected_low_fee = 25.0;
+        let estimates = calculation2(
+            &vec![accounts.get(0).unwrap().clone()],
+            false,
+            true,
+            &Some(150),
+            &tracker,
+        );
+        let expected_low_fee = 24.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
-        assert_ne!(estimates.low, expected_low_fee);
-        assert_ne!(estimates.medium, expected_medium_fee);
-        assert_ne!(estimates.high, expected_high_fee);
-        assert_ne!(estimates.very_high, expected_very_high_fee);
-
+        let expected_very_high_fee = 96.0;
+        assert_eq!(estimates.low, expected_low_fee);
+        assert_eq!(estimates.medium, expected_medium_fee);
+        assert_eq!(estimates.high, expected_high_fee);
+        assert_eq!(estimates.very_high, expected_very_high_fee);
     }
 
     #[tokio::test]
@@ -1364,13 +1495,13 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let v = vec![account_1];
-        let estimates = tracker.calculation1(&v, false, false, &None);
+        let estimates = calculation1(&v, false, false, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1379,14 +1510,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation1(&v, false, false, &Some(150));
+        let estimates = calculation1(&v, false, false, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1395,14 +1525,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation1(&v, false, true, &None);
+        let estimates = calculation1(&v, false, true, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1411,14 +1540,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation1(&v, false, true, &Some(150));
+        let estimates = calculation1(&v, false, true, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
-        let expected_low_fee = 0.0;
-        let expected_medium_fee = 25.5;
-        let expected_high_fee = 62.75;
-        let expected_very_high_fee = 92.54999999999998;
+        let expected_low_fee = 25.0;
+        let expected_medium_fee = 50.0;
+        let expected_high_fee = 75.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1453,13 +1581,13 @@ mod tests {
 
         // Now test the fee estimates for a known priority level, let's say medium (50th percentile)
         let v = vec![account_1];
-        let estimates = tracker.calculation2(&v, false, false, &None);
+        let estimates = calculation2(&v, false, false, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1468,14 +1596,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation2(&v, false, false, &Some(150));
+        let estimates = calculation2(&v, false, false, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1484,14 +1611,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation2(&v, false, true, &None);
+        let estimates = calculation2(&v, false, true, &None, &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1500,14 +1626,13 @@ mod tests {
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
 
-
-        let estimates = tracker.calculation2(&v, false, true, &Some(150));
+        let estimates = calculation2(&v, false, true, &Some(150), &tracker);
         // Since the fixed fees are evenly distributed, the 50th percentile should be the middle value
         let expected_min_fee = 0.0;
         let expected_low_fee = 25.0;
         let expected_medium_fee = 50.0;
         let expected_high_fee = 75.0;
-        let expected_very_high_fee = 95.0;
+        let expected_very_high_fee = 96.0;
         let expected_max_fee = 100.0;
         assert_eq!(estimates.min, expected_min_fee);
         assert_eq!(estimates.low, expected_low_fee);
@@ -1515,7 +1640,6 @@ mod tests {
         assert_eq!(estimates.high, expected_high_fee);
         assert_eq!(estimates.very_high, expected_very_high_fee);
         assert_eq!(estimates.unsafe_max, expected_max_fee);
-
     }
 
     #[test]
