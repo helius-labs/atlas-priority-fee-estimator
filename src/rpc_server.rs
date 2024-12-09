@@ -45,9 +45,11 @@ impl fmt::Debug for AtlasPriorityFeeEstimator {
     }
 }
 
+// The request V1 was not enforcing any validation on data validity so users can send misspelled properties and would
+// not know that the calculation was done using some defaults instead of their properties.
+// GetPrioritiyFeeEstimateRequest has validations in place but we still have clients that explicitly use v1 of API
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-// TODO: DKH - delete after all the users were notified
 pub struct GetPriorityFeeEstimateRequestLight {
     pub transaction: Option<String>,       // estimate fee for a txn
     pub account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
@@ -56,7 +58,6 @@ pub struct GetPriorityFeeEstimateRequestLight {
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-// TODO: DKH - Delete after all the users were notified
 pub struct GetPriorityFeeEstimateOptionsLight {
     // controls input txn encoding
     pub transaction_encoding: Option<UiTransactionEncoding>,
@@ -69,6 +70,7 @@ pub struct GetPriorityFeeEstimateOptionsLight {
     // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
     pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
     pub evaluate_empty_slot_as_zero: Option<bool>, // if true than slots with no transactions will be treated as 0
+    pub include_details: Option<bool>, // default to false, if provided will include detailed breakdown of data used for calculation
 }
 
 impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight {
@@ -83,6 +85,7 @@ impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight 
             include_vote: o.include_vote,
             recommended: o.recommended,
             evaluate_empty_slot_as_zero: o.evaluate_empty_slot_as_zero,
+            include_details: o.include_details,
         });
 
         GetPriorityFeeEstimateRequest {
@@ -121,6 +124,7 @@ pub struct GetPriorityFeeEstimateOptions {
     // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
     pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
     pub evaluate_empty_slot_as_zero: Option<bool>, // if true than slots with no transactions will be treated as 0
+    pub include_details: Option<bool>, // default to false, if provided will include detailed breakdown of data used for calculation
 }
 
 #[derive(Serialize, Clone, Debug, Default)]
@@ -130,38 +134,10 @@ pub struct GetPriorityFeeEstimateResponse {
     pub priority_fee_estimate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub priority_fee_levels: Option<MicroLamportPriorityFeeEstimates>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub priority_fee_estimate_details: Option<Vec<(String, MicroLamportPriorityFeeDetails)>>,
 }
 
-#[derive(Serialize, Clone, Debug, Default)]
-#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-pub struct GetPriorityFeeEstimateDetailsResponse {
-    pub priority_fee_estimate_details: Vec<(String, MicroLamportPriorityFeeDetails)>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority_fee_estimate: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub priority_fee_levels: Option<MicroLamportPriorityFeeEstimates>,
-}
-impl Into<GetPriorityFeeEstimateRequestLight> for GetPriorityFeeEstimateRequest {
-    fn into(self) -> GetPriorityFeeEstimateRequestLight {
-        let transaction = self.transaction;
-        let account_keys = self.account_keys;
-        let options = self.options.map(|o| GetPriorityFeeEstimateOptionsLight {
-            transaction_encoding: o.transaction_encoding,
-            priority_level: o.priority_level,
-            include_all_priority_fee_levels: o.include_all_priority_fee_levels,
-            lookback_slots: o.lookback_slots,
-            include_vote: o.include_vote,
-            recommended: o.recommended,
-            evaluate_empty_slot_as_zero: o.evaluate_empty_slot_as_zero,
-        });
-
-        GetPriorityFeeEstimateRequestLight {
-            transaction,
-            account_keys,
-            options,
-        }
-    }
-}
 #[rpc(server)]
 pub trait AtlasPriorityFeeEstimatorRpc {
     #[method(name = "health")]
@@ -169,34 +145,7 @@ pub trait AtlasPriorityFeeEstimatorRpc {
 
     // TODO: DKH - delete after all the users were notified about moving to strict parsing
     #[method(name = "getPriorityFeeEstimate")]
-    fn get_priority_fee_estimate_light(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
-    ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request)
-    }
-
-    // TODO: DKH - delete after all the users were notified about moving to strict parsing
-    #[method(name = "getPriorityFeeEstimateDetails")]
-    fn get_priority_fee_estimate_details_light(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
-        self.get_priority_fee_estimate_details_v1(get_priority_fee_estimate_request)
-    }
-
-    // TODO: DKH - rename annotation method name to "getPriorityFeeEstimateStrict" to "getPriorityFeeEstimate"
-    #[method(name = "getPriorityFeeEstimateStrict")]
     fn get_priority_fee_estimate(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-    ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request.into())
-    }
-
-    // TODO: DKH - remove
-    #[method(name = "getPriorityFeeEstimateTest")]
-    fn get_priority_fee_estimate_test(
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
@@ -214,18 +163,6 @@ pub trait AtlasPriorityFeeEstimatorRpc {
         &self,
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
-
-    #[method(name = "getPriorityFeeEstimateDetailsV1")]
-    fn get_priority_fee_estimate_details_v1(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse>;
-
-    #[method(name = "getPriorityFeeEstimateDetailsV2")]
-    fn get_priority_fee_estimate_details_v2(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse>;
 }
 
 fn validate_get_priority_fee_estimate_request(
@@ -412,23 +349,6 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         self.execute_priority_fee_estimate_coordinator(get_priority_fee_estimate_request, false)
     }
-
-    fn get_priority_fee_estimate_details_v1(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
-        self.execute_priority_fee_details_coordinator(
-            get_priority_fee_estimate_request.into(),
-            true,
-        )
-    }
-
-    fn get_priority_fee_estimate_details_v2(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
-        self.execute_priority_fee_details_coordinator(get_priority_fee_estimate_request, false)
-    }
 }
 
 impl AtlasPriorityFeeEstimator {
@@ -451,6 +371,7 @@ impl AtlasPriorityFeeEstimator {
         is_v1: bool,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         let options = get_priority_fee_estimate_request.options.clone();
+        let include_details = options.as_ref().and_then(|op| op.include_details).unwrap_or(false);
         let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
         if let Some(reason) = reason {
             return Err(reason);
@@ -464,7 +385,7 @@ impl AtlasPriorityFeeEstimator {
             .iter()
             .filter_map(|a| Pubkey::from_str(a).ok())
             .collect();
-        let lookback_slots = options.clone().map(|o| o.lookback_slots).flatten();
+        let lookback_slots = options.as_ref().map(|o| o.lookback_slots).flatten();
         if let Some(lookback_slots) = &lookback_slots {
             if *lookback_slots < 1 || *lookback_slots as usize > self.max_lookback_slots {
                 return Err(invalid_request("lookback_slots must be between 1 and 150"));
@@ -487,100 +408,20 @@ impl AtlasPriorityFeeEstimator {
                 &lookback_slots,
             )
         };
-        let priority_fee_levels = match self.priority_fee_tracker.calculate_priority_fee(&calc) {
-            Ok(level) => level,
-            Err(e) => {
-                warn!("failed to calculate priority_fee_levels: {:#?}", e);
-                return Err(ErrorObjectOwned::owned(
-                    INTERNAL_ERROR_CODE,
-                    INTERNAL_ERROR_MSG,
-                    None::<String>,
-                ));
-            }
-        };
-        if let Some(options) = options.clone() {
-            if options.include_all_priority_fee_levels == Some(true) {
-                return Ok(GetPriorityFeeEstimateResponse {
-                    priority_fee_estimate: None,
-                    priority_fee_levels: Some(priority_fee_levels),
-                });
-            }
-            if let Some(priority_level) = options.priority_level {
-                let priority_fee = match priority_level {
-                    PriorityLevel::Min => priority_fee_levels.min,
-                    PriorityLevel::Low => priority_fee_levels.low,
-                    PriorityLevel::Medium => priority_fee_levels.medium,
-                    PriorityLevel::High => priority_fee_levels.high,
-                    PriorityLevel::VeryHigh => priority_fee_levels.very_high,
-                    PriorityLevel::UnsafeMax => priority_fee_levels.unsafe_max,
-                    PriorityLevel::Default => priority_fee_levels.medium,
-                };
-                return Ok(GetPriorityFeeEstimateResponse {
-                    priority_fee_estimate: Some(priority_fee),
-                    priority_fee_levels: None,
-                });
-            }
-        }
-        let recommended = options.map_or(false, |o: GetPriorityFeeEstimateOptions| {
-            o.recommended.unwrap_or(false)
-        });
-        let priority_fee = if recommended {
-            get_recommended_fee(priority_fee_levels)
+        let result: anyhow::Result<(
+            MicroLamportPriorityFeeEstimates,
+            Option<HashMap<String, MicroLamportPriorityFeeDetails>>,
+        )> = if include_details {
+            self.priority_fee_tracker
+                .calculate_priority_fee_details(&calc)
+                .map(|(fee, details)| (fee, Some(details)))
         } else {
-            priority_fee_levels.medium
+            self.priority_fee_tracker
+                .calculate_priority_fee(&calc)
+                .map(|fee| (fee, None))
         };
-        Ok(GetPriorityFeeEstimateResponse {
-            priority_fee_estimate: Some(priority_fee),
-            priority_fee_levels: None,
-        })
-    }
 
-    fn execute_priority_fee_details_coordinator(
-        &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
-        is_v1: bool,
-    ) -> RpcResult<GetPriorityFeeEstimateDetailsResponse> {
-        let options = get_priority_fee_estimate_request.options.clone();
-        let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
-        if let Some(reason) = reason {
-            return Err(reason);
-        }
-        let accounts = get_accounts(&self.rpc_client, get_priority_fee_estimate_request);
-        if let Err(e) = accounts {
-            return Err(e);
-        }
-        let accounts: Vec<Pubkey> = accounts
-            .unwrap()
-            .iter()
-            .filter_map(|a| Pubkey::from_str(a).ok())
-            .collect();
-        let lookback_slots = options.clone().map(|o| o.lookback_slots).flatten();
-        if let Some(lookback_slots) = &lookback_slots {
-            if *lookback_slots < 1 || *lookback_slots as usize > self.max_lookback_slots {
-                return Err(invalid_request("lookback_slots must be between 1 and 150"));
-            }
-        }
-        let include_vote = should_include_vote(&options);
-        let include_empty_slots = should_include_empty_slots(&options);
-        let calc = if is_v1 {
-            Calculations::new_calculation1(
-                &accounts,
-                include_vote,
-                include_empty_slots,
-                &lookback_slots,
-            )
-        } else {
-            Calculations::new_calculation2(
-                &accounts,
-                include_vote,
-                include_empty_slots,
-                &lookback_slots,
-            )
-        };
-        let (total_priority_fee_levels, priority_fee_levels) = match self
-            .priority_fee_tracker
-            .calculate_priority_fee_details(&calc)
-        {
+        let (total_priority_fee_levels, priority_fee_levels) = match result {
             Ok(level) => level,
             Err(e) => {
                 warn!("failed to calculate priority_fee_levels details: {:#?}", e);
@@ -592,19 +433,25 @@ impl AtlasPriorityFeeEstimator {
             }
         };
 
-        let mut priority_fees: Vec<(String, MicroLamportPriorityFeeDetails)> =
-            priority_fee_levels.into_iter().collect();
-        priority_fees.sort_by(|a, b| b.0.cmp(&a.0));
+        let priority_fee_levels: Option<Vec<(String, MicroLamportPriorityFeeDetails)>> =
+        match priority_fee_levels {
+            None => None,
+            Some(fees_map) => {
+                let mut fees: Vec<(String, MicroLamportPriorityFeeDetails)> = fees_map.into_iter().collect();
+                fees.sort_by(|a, b| b.0.cmp(&a.0));
+                Some(fees)
+            }
+        };
 
-        if let Some(options) = options.clone() {
+        if let Some(options) = options.as_ref() {
             if options.include_all_priority_fee_levels == Some(true) {
-                return Ok(GetPriorityFeeEstimateDetailsResponse {
-                    priority_fee_estimate_details: priority_fees,
+                return Ok(GetPriorityFeeEstimateResponse {
+                    priority_fee_estimate_details: priority_fee_levels,
                     priority_fee_estimate: None,
                     priority_fee_levels: Some(total_priority_fee_levels),
                 });
             }
-            if let Some(priority_level) = options.priority_level {
+            if let Some(priority_level) = options.priority_level.as_ref() {
                 let priority_fee = match priority_level {
                     PriorityLevel::Min => total_priority_fee_levels.min,
                     PriorityLevel::Low => total_priority_fee_levels.low,
@@ -614,8 +461,8 @@ impl AtlasPriorityFeeEstimator {
                     PriorityLevel::UnsafeMax => total_priority_fee_levels.unsafe_max,
                     PriorityLevel::Default => total_priority_fee_levels.medium,
                 };
-                return Ok(GetPriorityFeeEstimateDetailsResponse {
-                    priority_fee_estimate_details: priority_fees,
+                return Ok(GetPriorityFeeEstimateResponse {
+                    priority_fee_estimate_details: priority_fee_levels,
                     priority_fee_estimate: Some(priority_fee),
                     priority_fee_levels: None,
                 });
@@ -629,8 +476,8 @@ impl AtlasPriorityFeeEstimator {
         } else {
             total_priority_fee_levels.medium
         };
-        Ok(GetPriorityFeeEstimateDetailsResponse {
-            priority_fee_estimate_details: priority_fees,
+        Ok(GetPriorityFeeEstimateResponse {
+            priority_fee_estimate_details: priority_fee_levels,
             priority_fee_estimate: Some(priority_fee),
             priority_fee_levels: None,
         })
@@ -666,10 +513,7 @@ pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates
 #[cfg(test)]
 mod tests {
     use crate::priority_fee::PriorityFeeTracker;
-    use crate::rpc_server::{
-        AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer,
-        GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateRequest,
-    };
+    use crate::rpc_server::{AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer, GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateOptionsLight, GetPriorityFeeEstimateRequest, GetPriorityFeeEstimateRequestLight};
     use cadence::{NopMetricSink, StatsdClient};
     use jsonrpsee::core::Cow;
     use jsonrpsee::core::__reexports::serde_json;
@@ -753,9 +597,9 @@ mod tests {
         });
         let resp = result.unwrap();
         let levels = resp.priority_fee_levels.unwrap();
-        assert_eq!(levels.min, 100.0);
-        assert_eq!(levels.low, 100.0);
-        assert_eq!(levels.medium, 150.0);
+        assert_eq!(levels.min, 200.0);
+        assert_eq!(levels.low, 200.0);
+        assert_eq!(levels.medium, 200.0);
         assert_eq!(levels.high, 200.0);
         assert_eq!(levels.very_high, 200.0);
         assert_eq!(levels.unsafe_max, 200.0);
@@ -827,7 +671,7 @@ mod tests {
             (r#"{"accountkeys": null}"#, "unknown field `accountkeys`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 15"),
             (r#"{"accountKeys": [1, 2]}"#, "invalid type: integer `1`, expected a string at line 1 column 19"),
             (r#"{"option": null}"#, "unknown field `option`, expected one of `transaction`, `accountKeys`, `options` at line 1 column 10"),
-            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended`, `evaluateEmptySlotAsZero` at line 1 column 36"),
+            (r#"{"options": {"transaction_encoding":null}}"#, "unknown field `transaction_encoding`, expected one of `transactionEncoding`, `priorityLevel`, `includeAllPriorityFeeLevels`, `lookbackSlots`, `includeVote`, `recommended`, `evaluateEmptySlotAsZero`, `includeDetails` at line 1 column 36"),
             (r#"{"options": {"priorityLevel":"HIGH"}}"#, "unknown variant `HIGH`, expected one of `Min`, `Low`, `Medium`, `High`, `VeryHigh`, `UnsafeMax`, `Default` at line 1 column 36"),
             (r#"{"options": {"includeAllPriorityFeeLevels":"no"}}"#, "invalid type: string \"no\", expected a boolean at line 1 column 48"),
             (r#"{"options": {"lookbackSlots":"no"}}"#, "invalid type: string \"no\", expected u32 at line 1 column 34"),
