@@ -5,7 +5,7 @@ use crate::model::{
     PriorityLevel, SlotPriorityFees,
 };
 use crate::priority_fee_calculation::Calculations;
-use crate::priority_fee_calculation::Calculations::Calculation1;
+use crate::priority_fee_calculation::Calculations::Calculation2;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
 use cadence_macros::statsd_count;
@@ -231,7 +231,7 @@ impl PriorityFeeTracker {
     }
 
     fn record_general_fees(&self) {
-        let global_fees = self.calculate_priority_fee(&Calculation1 {
+        let global_fees = self.calculate_priority_fee(&Calculation2 {
             accounts: &vec![],
             include_vote: false,
             include_empty_slots: false,
@@ -1472,6 +1472,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_exclude_vote() {
+        // same test as above but with an extra slot to throw off the value
+        init_metrics();
         let tracker = PriorityFeeTracker::new(10);
 
         let mut fees = vec![];
@@ -1558,6 +1560,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_exclude_vote_v2() {
+        // same test as above but with an extra slot to throw off the value
+        init_metrics();
         let tracker = PriorityFeeTracker::new(10);
 
         let mut fees = vec![];
@@ -1644,6 +1648,8 @@ mod tests {
 
     #[test]
     fn test_constructing_accounts() {
+        // same test as above but with an extra slot to throw off the value
+        init_metrics();
         for (test_id, data) in generate_data().iter().enumerate() {
             let (message_accounts, header, expectation) = data;
             let result = construct_writable_accounts(message_accounts.clone(), header);
