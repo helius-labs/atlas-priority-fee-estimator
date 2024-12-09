@@ -145,11 +145,11 @@ pub trait AtlasPriorityFeeEstimatorRpc {
 
     // TODO: DKH - delete after all the users were notified about moving to strict parsing
     #[method(name = "getPriorityFeeEstimate")]
-    fn get_priority_fee_estimate_light(
+    fn get_priority_fee_estimate(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
-        self.get_priority_fee_estimate_v1(get_priority_fee_estimate_request)
+        self.get_priority_fee_estimate_v2(get_priority_fee_estimate_request)
     }
 
     #[method(name = "getPriorityFeeEstimateV1")]
@@ -537,9 +537,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight::default()),
+            options: Some(GetPriorityFeeEstimateOptions::default()),
             ..Default::default()
         });
         let resp = result.unwrap();
@@ -562,7 +562,7 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
             ..Default::default()
         });
@@ -587,9 +587,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight {
+            options: Some(GetPriorityFeeEstimateOptions {
                 include_all_priority_fee_levels: Some(true),
                 ..Default::default()
             }),
@@ -597,9 +597,9 @@ mod tests {
         });
         let resp = result.unwrap();
         let levels = resp.priority_fee_levels.unwrap();
-        assert_eq!(levels.min, 100.0);
-        assert_eq!(levels.low, 100.0);
-        assert_eq!(levels.medium, 150.0);
+        assert_eq!(levels.min, 200.0);
+        assert_eq!(levels.low, 200.0);
+        assert_eq!(levels.medium, 200.0);
         assert_eq!(levels.high, 200.0);
         assert_eq!(levels.very_high, 200.0);
         assert_eq!(levels.unsafe_max, 200.0);
@@ -621,9 +621,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight {
+            options: Some(GetPriorityFeeEstimateOptions {
                 recommended: Some(true),
                 ..Default::default()
             }),
