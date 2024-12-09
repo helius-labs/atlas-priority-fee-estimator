@@ -537,9 +537,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight::default()),
+            options: Some(GetPriorityFeeEstimateOptions::default()),
             ..Default::default()
         });
         let resp = result.unwrap();
@@ -562,7 +562,7 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
             ..Default::default()
         });
@@ -587,9 +587,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight {
+            options: Some(GetPriorityFeeEstimateOptions {
                 include_all_priority_fee_levels: Some(true),
                 ..Default::default()
             }),
@@ -621,9 +621,9 @@ mod tests {
             max_lookback_slots: 150,
         };
 
-        let result = server.get_priority_fee_estimate_light(GetPriorityFeeEstimateRequestLight {
+        let result = server.get_priority_fee_estimate(GetPriorityFeeEstimateRequest {
             account_keys: Some(vec![acc1.to_string(), acc2.to_string()]),
-            options: Some(GetPriorityFeeEstimateOptionsLight {
+            options: Some(GetPriorityFeeEstimateOptions {
                 recommended: Some(true),
                 ..Default::default()
             }),
