@@ -127,13 +127,13 @@ reused during analysis and during dev / operational stages
 {
   "id": "version1",
   "jsonrpc": "2.0",
-  "method": "getPriorityFeeEstimateDetails",
+  "method": "getPriorityFeeEstimate",
   "params": [
     {
       "accountKeys": [
 "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
       ],
-      "options": {"recommended": true}
+      "options": {"recommended": true, "includeDetails":  true}
     }
   ]
 }
