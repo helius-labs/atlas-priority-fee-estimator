@@ -45,57 +45,6 @@ impl fmt::Debug for AtlasPriorityFeeEstimator {
     }
 }
 
-// The request V1 was not enforcing any validation on data validity so users can send misspelled properties and would
-// not know that the calculation was done using some defaults instead of their properties.
-// GetPrioritiyFeeEstimateRequest has validations in place but we still have clients that explicitly use v1 of API
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-pub struct GetPriorityFeeEstimateRequestLight {
-    pub transaction: Option<String>,       // estimate fee for a txn
-    pub account_keys: Option<Vec<String>>, // estimate fee for a list of accounts
-    pub options: Option<GetPriorityFeeEstimateOptionsLight>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
-#[serde(rename_all(serialize = "camelCase", deserialize = "camelCase"))]
-pub struct GetPriorityFeeEstimateOptionsLight {
-    // controls input txn encoding
-    pub transaction_encoding: Option<UiTransactionEncoding>,
-    // controls custom priority fee level response
-    pub priority_level: Option<PriorityLevel>, // Default to MEDIUM
-    pub include_all_priority_fee_levels: Option<bool>, // Include all priority level estimates in the response
-    #[serde()]
-    pub lookback_slots: Option<u32>, // how many slots to look back on, default 50, min 1, max 300
-    pub include_vote: Option<bool>, // include vote txns in the estimate
-    // returns recommended fee, incompatible with custom controls. Currently the recommended fee is the median fee excluding vote txns
-    pub recommended: Option<bool>, // return the recommended fee (median fee excluding vote txns)
-    pub evaluate_empty_slot_as_zero: Option<bool>, // if true than slots with no transactions will be treated as 0
-    pub include_details: Option<bool>, // default to false, if provided will include detailed breakdown of data used for calculation
-}
-
-impl Into<GetPriorityFeeEstimateRequest> for GetPriorityFeeEstimateRequestLight {
-    fn into(self) -> GetPriorityFeeEstimateRequest {
-        let transaction = self.transaction;
-        let account_keys = self.account_keys;
-        let options = self.options.map(|o| GetPriorityFeeEstimateOptions {
-            transaction_encoding: o.transaction_encoding,
-            priority_level: o.priority_level,
-            include_all_priority_fee_levels: o.include_all_priority_fee_levels,
-            lookback_slots: o.lookback_slots,
-            include_vote: o.include_vote,
-            recommended: o.recommended,
-            evaluate_empty_slot_as_zero: o.evaluate_empty_slot_as_zero,
-            include_details: o.include_details,
-        });
-
-        GetPriorityFeeEstimateRequest {
-            transaction,
-            account_keys,
-            options,
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 #[serde(
     rename_all(serialize = "camelCase", deserialize = "camelCase"),
@@ -143,7 +92,6 @@ pub trait AtlasPriorityFeeEstimatorRpc {
     #[method(name = "health")]
     fn health(&self) -> String;
 
-    // TODO: DKH - delete after all the users were notified about moving to strict parsing
     #[method(name = "getPriorityFeeEstimate")]
     fn get_priority_fee_estimate(
         &self,
@@ -155,7 +103,7 @@ pub trait AtlasPriorityFeeEstimatorRpc {
     #[method(name = "getPriorityFeeEstimateV1")]
     fn get_priority_fee_estimate_v1(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse>;
 
     #[method(name = "getPriorityFeeEstimateV2")]
@@ -335,10 +283,10 @@ impl AtlasPriorityFeeEstimatorRpcServer for AtlasPriorityFeeEstimator {
 
     fn get_priority_fee_estimate_v1(
         &self,
-        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequestLight,
+        get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
         self.execute_priority_fee_estimate_coordinator(
-            get_priority_fee_estimate_request.into(),
+            get_priority_fee_estimate_request,
             true,
         )
     }
@@ -494,7 +442,7 @@ fn should_include_vote(options: &Option<GetPriorityFeeEstimateOptions>) -> bool 
 
 fn should_include_empty_slots(options: &Option<GetPriorityFeeEstimateOptions>) -> bool {
     if let Some(options) = options {
-        return options.evaluate_empty_slot_as_zero.unwrap_or(false);
+        return options.evaluate_empty_slot_as_zero.unwrap_or(true);
     }
     false
 }
@@ -513,7 +461,7 @@ pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates
 #[cfg(test)]
 mod tests {
     use crate::priority_fee::PriorityFeeTracker;
-    use crate::rpc_server::{AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer, GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateOptionsLight, GetPriorityFeeEstimateRequest, GetPriorityFeeEstimateRequestLight};
+    use crate::rpc_server::{AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer, GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateRequest};
     use cadence::{NopMetricSink, StatsdClient};
     use jsonrpsee::core::Cow;
     use jsonrpsee::core::__reexports::serde_json;
