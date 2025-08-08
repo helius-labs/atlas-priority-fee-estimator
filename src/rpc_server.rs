@@ -13,7 +13,7 @@ use crate::model::{
 use crate::priority_fee::{construct_writable_accounts, PriorityFeeTracker};
 use crate::priority_fee_calculation::Calculations;
 use crate::solana::solana_rpc::decode_and_deserialize;
-use cadence_macros::{statsd_count, statsd_time};
+use cadence_macros::{statsd_count, statsd_gauge, statsd_time};
 use jsonrpsee::types::error::{INTERNAL_ERROR_CODE, INTERNAL_ERROR_MSG};
 use jsonrpsee::{
     core::{async_trait, RpcResult},
@@ -198,12 +198,24 @@ fn get_from_address_lookup_tables(
         statsd_time!("get_multiple_accounts_time", rpc_start.elapsed());
         match accounts {
             Ok(accounts) => {
+                // Track response sizes to correlate with wire-time
+                let mut num_returned: u64 = 0;
+                let mut num_null: u64 = 0;
+                let mut total_bytes: u64 = 0;
+                let mut max_bytes: u64 = 0;
                 let parse_start = Instant::now();
                 for (i, account) in accounts.into_iter().enumerate() {
                     if account.is_none() {
+                        num_null += 1;
                         continue;
                     }
                     let account = account.unwrap();
+                    num_returned += 1;
+                    let data_len = account.data.len() as u64;
+                    total_bytes += data_len;
+                    if data_len > max_bytes {
+                        max_bytes = data_len;
+                    }
                     let account_pubkey = address_table_lookup_accounts[i];
                     let indices = lookup_table_indices.get(&account_pubkey.to_string());
                     if indices.is_none() {
@@ -235,6 +247,11 @@ fn get_from_address_lookup_tables(
                     }
                 }
                 statsd_time!("alt_parse_time", parse_start.elapsed());
+                // Emit size metrics as gauges (one sample per request)
+                statsd_gauge!("alt_accounts_returned", num_returned);
+                statsd_gauge!("alt_null_accounts", num_null);
+                statsd_gauge!("alt_total_bytes", total_bytes);
+                statsd_gauge!("alt_max_bytes", max_bytes);
             }
             Err(e) => {
                 info!("error getting accounts: {:?}", e);
