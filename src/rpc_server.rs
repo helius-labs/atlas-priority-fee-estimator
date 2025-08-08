@@ -193,9 +193,12 @@ fn get_from_address_lookup_tables(
             "get_from_address_lookup_tables_num_accounts",
             address_table_lookup_accounts.len() as i64
         );
+        let rpc_start = Instant::now();
         let accounts = rpc_client.get_multiple_accounts(address_table_lookup_accounts.as_slice());
+        statsd_time!("get_multiple_accounts_time", rpc_start.elapsed());
         match accounts {
             Ok(accounts) => {
+                let parse_start = Instant::now();
                 for (i, account) in accounts.into_iter().enumerate() {
                     if account.is_none() {
                         continue;
@@ -231,6 +234,7 @@ fn get_from_address_lookup_tables(
                         }
                     }
                 }
+                statsd_time!("alt_parse_time", parse_start.elapsed());
             }
             Err(e) => {
                 info!("error getting accounts: {:?}", e);
@@ -262,10 +266,17 @@ fn get_accounts(
                     "unsupported encoding: {tx_encoding}. Supported encodings: base58, base64"
                 ))
             })?;
+            let decode_start = Instant::now();
             let (_, transaction) =
                 decode_and_deserialize::<VersionedTransaction>(transaction, binary_encoding)?;
+            statsd_time!("txn_decode_time", decode_start.elapsed());
             let account_keys: Vec<String> = vec![
-                get_from_account_keys(&transaction),
+                {
+                    let static_keys_start = Instant::now();
+                    let keys = get_from_account_keys(&transaction);
+                    statsd_time!("static_keys_extract_time", static_keys_start.elapsed());
+                    keys
+                },
                 get_from_address_lookup_tables(rpc_client, &transaction),
             ]
             .concat();
@@ -318,21 +329,31 @@ impl AtlasPriorityFeeEstimator {
         get_priority_fee_estimate_request: GetPriorityFeeEstimateRequest,
         is_v1: bool,
     ) -> RpcResult<GetPriorityFeeEstimateResponse> {
+        let req_start = Instant::now();
+        statsd_count!("rpc_requests_started", 1);
         let options = get_priority_fee_estimate_request.options.clone();
         let include_details = options.as_ref().and_then(|op| op.include_details).unwrap_or(false);
         let reason = validate_get_priority_fee_estimate_request(&get_priority_fee_estimate_request);
         if let Some(reason) = reason {
+            statsd_count!("rpc_requests_failed", 1);
+            statsd_time!("total_request_time", req_start.elapsed());
             return Err(reason);
         }
+        let accounts_overall_start = Instant::now();
         let accounts = get_accounts(&self.rpc_client, get_priority_fee_estimate_request);
         if let Err(e) = accounts {
+            statsd_count!("rpc_requests_failed", 1);
+            statsd_time!("total_request_time", req_start.elapsed());
             return Err(e);
         }
+        let parse_pubkeys_start = Instant::now();
         let accounts: Vec<Pubkey> = accounts
             .unwrap()
             .iter()
             .filter_map(|a| Pubkey::from_str(a).ok())
             .collect();
+        statsd_time!("pubkey_parse_time", parse_pubkeys_start.elapsed());
+        statsd_time!("accounts_resolution_time", accounts_overall_start.elapsed());
         let lookback_slots = options.as_ref().map(|o| o.lookback_slots).flatten();
         if let Some(lookback_slots) = &lookback_slots {
             if *lookback_slots < 1 || *lookback_slots as usize > self.max_lookback_slots {
@@ -393,6 +414,8 @@ impl AtlasPriorityFeeEstimator {
 
         if let Some(options) = options.as_ref() {
             if options.include_all_priority_fee_levels == Some(true) {
+                statsd_count!("rpc_requests_finished", 1);
+                statsd_time!("total_request_time", req_start.elapsed());
                 return Ok(GetPriorityFeeEstimateResponse {
                     priority_fee_estimate_details: priority_fee_levels,
                     priority_fee_estimate: None,
@@ -409,6 +432,8 @@ impl AtlasPriorityFeeEstimator {
                     PriorityLevel::UnsafeMax => total_priority_fee_levels.unsafe_max,
                     PriorityLevel::Default => total_priority_fee_levels.medium,
                 };
+                statsd_count!("rpc_requests_finished", 1);
+                statsd_time!("total_request_time", req_start.elapsed());
                 return Ok(GetPriorityFeeEstimateResponse {
                     priority_fee_estimate_details: priority_fee_levels,
                     priority_fee_estimate: Some(priority_fee),
@@ -424,6 +449,8 @@ impl AtlasPriorityFeeEstimator {
         } else {
             total_priority_fee_levels.medium
         };
+        statsd_count!("rpc_requests_finished", 1);
+        statsd_time!("total_request_time", req_start.elapsed());
         Ok(GetPriorityFeeEstimateResponse {
             priority_fee_estimate_details: priority_fee_levels,
             priority_fee_estimate: Some(priority_fee),

@@ -84,6 +84,7 @@ impl GrpcGeyserImpl {
                                     statsd_count!("grpc_consume_error", 1);
                                 }
                             }
+                            statsd_count!("grpc_updates_received", 1);
                             match update.update_oneof {
                                 Some(UpdateOneof::Ping(_)) => {
                                     // This is necessary to keep load balancers that expect client pings alive. If your load balancer doesn't

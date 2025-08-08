@@ -8,8 +8,7 @@ use crate::priority_fee_calculation::Calculations;
 use crate::priority_fee_calculation::Calculations::Calculation2;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
-use cadence_macros::statsd_count;
-use cadence_macros::statsd_gauge;
+use cadence_macros::{statsd_count, statsd_gauge, statsd_time};
 use dashmap::DashMap;
 use solana::storage::confirmed_block::Message;
 use solana_program_runtime::compute_budget::ComputeBudget;
@@ -158,25 +157,33 @@ impl GrpcConsumer for PriorityFeeTracker {
                 statsd_count!("txns_received", block.transactions.len() as i64);
                 let slot = block.slot;
                 for txn in block.transactions {
+                    let txn_extract_start = std::time::Instant::now();
                     let res = extract_from_transaction(txn);
                     if let Err(error) = res {
                         statsd_count!(error.into(), 1);
                         continue;
                     }
                     let (message, writable_accounts, is_vote) = res.unwrap();
+                    statsd_time!("tracker_extract_from_transaction_time", txn_extract_start.elapsed());
 
+                    let msg_extract_start = std::time::Instant::now();
                     let res = extract_from_message(message);
                     if let Err(error) = res {
                         statsd_count!(error.into(), 1);
                         continue;
                     }
                     let (accounts, instructions, header) = res.unwrap();
+                    statsd_time!("tracker_extract_from_message_time", msg_extract_start.elapsed());
+                    statsd_count!("tracker_accounts_in_message", accounts.len() as i64);
+                    statsd_count!("tracker_instructions_in_message", instructions.len() as i64);
                     let mut compute_budget = self.compute_budget;
+                    let calc_details_start = std::time::Instant::now();
                     let priority_fee_details = calculate_priority_fee_details(
                         &accounts,
                         &instructions,
                         &mut compute_budget,
                     );
+                    statsd_time!("tracker_calc_priority_fee_details_time", calc_details_start.elapsed());
 
                     let writable_accounts = vec![
                         construct_writable_accounts(accounts, &header),
@@ -189,6 +196,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                         writable_accounts.len() as i64
                     );
                     statsd_count!("txns_processed", 1);
+                    let push_start = std::time::Instant::now();
                     match priority_fee_details {
                         Ok(priority_fee_details) => self.push_priority_fee_for_txn(
                             slot,
@@ -200,6 +208,7 @@ impl GrpcConsumer for PriorityFeeTracker {
                             error!("error processing priority fee details: {:?}", e);
                         }
                     }
+                    statsd_time!("tracker_push_priority_fee_for_txn_time", push_start.elapsed());
                 }
             }
             _ => return Ok(()),
@@ -281,14 +290,23 @@ impl PriorityFeeTracker {
     ) {
         // update the slot cache so we can keep track of the slots we have processed in order
         // for removal later
+        let slot_cache_start = std::time::Instant::now();
         let slot_to_remove = self.slot_cache.push_pop(slot);
+        statsd_time!("slot_cache_push_pop_time", slot_cache_start.elapsed());
+        statsd_count!("tracker_accounts_per_txn", accounts.len() as i64);
         if !self.priority_fees.contains_key(&slot) {
+            let insert_start = std::time::Instant::now();
             self.priority_fees.insert(
                 slot,
                 SlotPriorityFees::new(slot, accounts, priority_fee, is_vote),
             );
+            statsd_time!("dashmap_insert_time", insert_start.elapsed());
         } else {
             // update the slot priority fees
+            let modify_start = std::time::Instant::now();
+            // We log how many accounts will be updated before the closure to avoid
+            // changing capture semantics or cloning the vector.
+            statsd_count!("dashmap_accounts_updated", accounts.len() as i64);
             self.priority_fees.entry(slot).and_modify(|priority_fees| {
                 priority_fees.fees.add_fee(priority_fee as f64, is_vote);
                 for account in accounts {
@@ -299,9 +317,12 @@ impl PriorityFeeTracker {
                         .or_insert(Fees::new(priority_fee as f64, is_vote));
                 }
             });
+            statsd_time!("dashmap_modify_slot_fees_time", modify_start.elapsed());
         }
-        if slot_to_remove.is_some() {
-            self.priority_fees.remove(&slot_to_remove.unwrap());
+        if let Some(to_remove) = slot_to_remove {
+            let evict_start = std::time::Instant::now();
+            self.priority_fees.remove(&to_remove);
+            statsd_time!("dashmap_remove_time", evict_start.elapsed());
         }
     }
 

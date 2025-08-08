@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use dashmap::DashSet;
 use queues::{CircularBuffer, IsQueue};
 use solana_sdk::slot_history::Slot;
+use cadence_macros::{statsd_count, statsd_time};
 use tracing::error;
 
 #[derive(Debug, Clone)]
@@ -35,11 +36,14 @@ impl SlotCache {
                     return None;
                 }
 
+                let add_start = std::time::Instant::now();
                 match slot_queue.add(slot) {
                     Ok(maybe_oldest_slot) => {
+                        statsd_time!("slot_cache_add_time", add_start.elapsed());
                         if let Some(oldest_slot) = maybe_oldest_slot
                         {
                             self.slot_set.remove(&oldest_slot);
+                            statsd_count!("slot_cache_evictions", 1);
                         }
                         self.slot_set.insert(slot);
                         maybe_oldest_slot
