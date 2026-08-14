@@ -604,7 +604,7 @@ mod tests {
 
     const V1_TRANSFER: &str = "gQEAAQcAAABHDtRHaN4h+Qz/NWrSLWqQy0Ll/OZ997p367TlR+AvbwEDCQzu6znzPcjsG+gTC/86u2toD3DdQweOolXhtp3f+rQGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApAEAAAAAAAAQpAAAAgIMAAABAgAAAOgDAAAAAAAApLMYd8TpAEgv1M4fT21eDi5Mu0gKcD7B+vX9RTFWPziVKWApM3s3np5zEA+nwI5ZDiIc0JwBfJYNLQZulrWnAg==";
 
-    /// The SDK path: a v1 transaction must yield a usable writable-account
+    /// A v1 transaction must yield a usable writable-account
     /// list without any lookup-table resolution, since v1 has no ALTs.
     #[test]
     fn test_extracts_writable_accounts_from_v1_transaction() {
@@ -621,10 +621,22 @@ mod tests {
             "v1 carries no address table lookups"
         );
 
+        // 3 inline addresses, header reqSig=1 roSigned=0 roUnsigned=1, so the
+        // trailing readonly account (System Program) must be dropped and the
+        // signer plus the writable recipient kept.
+        let all_keys: Vec<String> = transaction
+            .message
+            .static_account_keys()
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        assert_eq!(all_keys.len(), 3, "v1 vector has 3 inline addresses");
+
         let accounts = get_from_account_keys(&transaction);
-        assert!(
-            !accounts.is_empty(),
-            "v1 must yield writable accounts to price against"
+        assert_eq!(
+            accounts,
+            all_keys[..2].to_vec(),
+            "expected the two writable accounts, readonly System Program excluded"
         );
         for account in &accounts {
             assert!(

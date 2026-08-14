@@ -153,6 +153,39 @@ fn v1_priority_rate(config: &TransactionConfig) -> Option<u64> {
     )
 }
 
+/// Resolves a transaction's priority rate in micro-lamports per compute unit,
+/// or `None` when the sample must be skipped.
+///
+/// Skipping matters: a V1 transaction carries no ComputeBudgetProgram
+/// instructions, so routing one through the instruction processor yields a
+/// rate of 0 rather than an error. Recording that would drag the percentiles
+/// down for every caller, so an unpriceable V1 sample is dropped instead.
+fn resolve_priority_rate(
+    config: Option<&TransactionConfig>,
+    accounts: &[Pubkey],
+    instructions: &[CompiledInstruction],
+    feature_set: &FeatureSet,
+) -> Option<u64> {
+    let Some(config) = config else {
+        return match calculate_priority_fee_details(accounts, instructions, feature_set) {
+            Ok(rate) => Some(rate),
+            Err(e) => {
+                error!("error processing priority fee details: {:?}", e);
+                statsd_count!("priority_fee_details_error", 1);
+                None
+            }
+        };
+    };
+
+    let Some(rate) = v1_priority_rate(config) else {
+        statsd_count!("v1_txn_unpriceable", 1);
+        return None;
+    };
+
+    statsd_count!("txns_priced_from_v1_config", 1);
+    Some(rate)
+}
+
 pub(crate) fn construct_writable_accounts<T>(
     message_accounts: Vec<T>,
     header: &Option<MessageHeader>,
@@ -202,20 +235,12 @@ impl GrpcConsumer for PriorityFeeTracker {
                         continue;
                     }
                     let (accounts, instructions, header, config) = res.unwrap();
-                    // V1 (SIMD-0385) prices from the message config; its
-                    // ComputeBudgetProgram instructions are no-ops, so running
-                    // them through the instruction processor would record 0.
-                    let priority_fee_details = match config.as_ref().and_then(v1_priority_rate) {
-                        Some(rate) => {
-                            statsd_count!("txns_priced_from_v1_config", 1);
-                            Ok(rate)
-                        }
-                        None => calculate_priority_fee_details(
-                            &accounts,
-                            &instructions,
-                            &self.feature_set,
-                        ),
-                    };
+                    let priority_rate = resolve_priority_rate(
+                        config.as_ref(),
+                        &accounts,
+                        &instructions,
+                        &self.feature_set,
+                    );
 
                     let writable_accounts = vec![
                         construct_writable_accounts(accounts, &header),
@@ -228,16 +253,13 @@ impl GrpcConsumer for PriorityFeeTracker {
                         writable_accounts.len() as i64
                     );
                     statsd_count!("txns_processed", 1);
-                    match priority_fee_details {
-                        Ok(priority_rate) => self.push_priority_fee_for_txn(
+                    if let Some(priority_rate) = priority_rate {
+                        self.push_priority_fee_for_txn(
                             slot,
                             writable_accounts,
                             priority_rate,
                             is_vote,
-                        ),
-                        Err(e) => {
-                            error!("error processing priority fee details: {:?}", e);
-                        }
+                        );
                     }
                 }
             }
@@ -473,6 +495,51 @@ mod tests {
     fn test_v1_rate_saturates_instead_of_overflowing() {
         let rate = v1_priority_rate(&v1_config(Some(u64::MAX), Some(1)));
         assert_eq!(rate, Some(u64::MAX));
+    }
+
+    /// An unpriceable V1 sample must be dropped, not recorded as 0. Falling
+    /// through to the instruction processor would return Ok(0) for a V1
+    /// transaction and pull the percentiles down.
+    #[test]
+    fn test_unpriceable_v1_is_skipped_not_recorded_as_zero() {
+        init_metrics();
+
+        let config = v1_config(Some(420), None);
+        assert_eq!(
+            resolve_priority_rate(Some(&config), &[], &[], &FeatureSet::all_enabled()),
+            None,
+            "v1 without a CU limit must be skipped"
+        );
+
+        let zero_limit = v1_config(Some(420), Some(0));
+        assert_eq!(
+            resolve_priority_rate(Some(&zero_limit), &[], &[], &FeatureSet::all_enabled()),
+            None,
+            "v1 with a zero CU limit must be skipped"
+        );
+    }
+
+    #[test]
+    fn test_priceable_v1_resolves_from_config() {
+        init_metrics();
+
+        let config = v1_config(Some(420), Some(42_000));
+        assert_eq!(
+            resolve_priority_rate(Some(&config), &[], &[], &FeatureSet::all_enabled()),
+            Some(10_000)
+        );
+    }
+
+    /// Legacy/V0 carry no config and must still resolve through the
+    /// instruction processor. An empty instruction list is a real 0 rate.
+    #[test]
+    fn test_legacy_resolves_through_instruction_processor() {
+        init_metrics();
+
+        assert_eq!(
+            resolve_priority_rate(None, &[], &[], &FeatureSet::all_enabled()),
+            Some(0)
+        );
     }
 
     fn calculation1(
