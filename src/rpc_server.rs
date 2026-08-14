@@ -263,7 +263,7 @@ fn get_accounts(
                 ))
             })?;
             let (_, transaction) =
-                decode_and_deserialize::<VersionedTransaction>(transaction, binary_encoding)?;
+                decode_and_deserialize(transaction, binary_encoding)?;
             let account_keys: Vec<String> = vec![
                 get_from_account_keys(&transaction),
                 get_from_address_lookup_tables(rpc_client, &transaction),
@@ -461,7 +461,10 @@ pub fn get_recommended_fee(priority_fee_levels: MicroLamportPriorityFeeEstimates
 #[cfg(test)]
 mod tests {
     use crate::priority_fee::PriorityFeeTracker;
-    use crate::rpc_server::{AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer, GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateRequest};
+    use crate::rpc_server::{get_from_account_keys, AtlasPriorityFeeEstimator, AtlasPriorityFeeEstimatorRpcServer, GetPriorityFeeEstimateOptions, GetPriorityFeeEstimateRequest};
+    use crate::solana::solana_rpc::decode_and_deserialize;
+    use solana_transaction_status::TransactionBinaryEncoding;
+    use std::str::FromStr;
     use cadence::{NopMetricSink, StatsdClient};
     use jsonrpsee::core::Cow;
     use jsonrpsee::core::__reexports::serde_json;
@@ -596,6 +599,38 @@ mod tests {
                 assert!(params.is_err());
                 assert_eq!(params.err().unwrap().to_string(), error, "testing {param}");
             }
+        }
+    }
+
+    const V1_TRANSFER: &str = "gQEAAQcAAABHDtRHaN4h+Qz/NWrSLWqQy0Ll/OZ997p367TlR+AvbwEDCQzu6znzPcjsG+gTC/86u2toD3DdQweOolXhtp3f+rQGm4hX/quBhPtof2NGGMA12sQ53BrrO1WYoPAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAApAEAAAAAAAAQpAAAAgIMAAABAgAAAOgDAAAAAAAApLMYd8TpAEgv1M4fT21eDi5Mu0gKcD7B+vX9RTFWPziVKWApM3s3np5zEA+nwI5ZDiIc0JwBfJYNLQZulrWnAg==";
+
+    /// The SDK path: a v1 transaction must yield a usable writable-account
+    /// list without any lookup-table resolution, since v1 has no ALTs.
+    #[test]
+    fn test_extracts_writable_accounts_from_v1_transaction() {
+        prep_statsd();
+
+        let (_, transaction) = decode_and_deserialize(
+            V1_TRANSFER.to_string(),
+            TransactionBinaryEncoding::Base64,
+        )
+        .expect("v1 vector should decode");
+
+        assert!(
+            transaction.message.address_table_lookups().is_none(),
+            "v1 carries no address table lookups"
+        );
+
+        let accounts = get_from_account_keys(&transaction);
+        assert!(
+            !accounts.is_empty(),
+            "v1 must yield writable accounts to price against"
+        );
+        for account in &accounts {
+            assert!(
+                Pubkey::from_str(account).is_ok(),
+                "expected a valid pubkey, got {account}"
+            );
         }
     }
 

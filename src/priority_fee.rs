@@ -11,11 +11,12 @@ use crate::slot_cache::SlotCache;
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
 use dashmap::DashMap;
-use solana::storage::confirmed_block::Message;
-use solana_program_runtime::compute_budget::ComputeBudget;
-use solana_program_runtime::prioritization_fee::PrioritizationFeeDetails;
-use solana_sdk::instruction::CompiledInstruction;
-use solana_sdk::transaction::TransactionError;
+use solana::storage::confirmed_block::{Message, TransactionConfig};
+use agave_feature_set::FeatureSet;
+use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
+use solana_message::compiled_instruction::CompiledInstruction;
+use solana_svm_transaction::instruction::SVMInstruction;
+use solana_transaction_error::TransactionError;
 use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use statrs::statistics::{Data, Distribution, OrderStatistics};
 use std::collections::HashMap;
@@ -27,10 +28,13 @@ use yellowstone_grpc_proto::geyser::{SubscribeUpdate, SubscribeUpdateTransaction
 use yellowstone_grpc_proto::prelude::{MessageHeader, Transaction, TransactionStatusMeta};
 use yellowstone_grpc_proto::solana;
 
+/// There are 10^6 micro-lamports in one lamport.
+const MICRO_LAMPORTS_PER_LAMPORT: u64 = 1_000_000;
+
 #[derive(Debug, Clone)]
 pub struct PriorityFeeTracker {
     priority_fees: Arc<PriorityFeesBySlot>,
-    compute_budget: ComputeBudget,
+    feature_set: Arc<FeatureSet>,
     slot_cache: SlotCache,
 }
 
@@ -76,11 +80,17 @@ fn extract_from_transaction(
 fn extract_from_message(
     message: Message,
 ) -> Result<
-    (Vec<Pubkey>, Vec<CompiledInstruction>, Option<MessageHeader>),
+    (
+        Vec<Pubkey>,
+        Vec<CompiledInstruction>,
+        Option<MessageHeader>,
+        Option<TransactionConfig>,
+    ),
     TransactionValidationError,
 > {
     let account_keys = message.account_keys;
     let compiled_instructions = message.instructions;
+    let config = message.config;
 
     let accounts: Result<Vec<Pubkey>, _> = account_keys.into_iter().map(Pubkey::try_from).collect();
     if let Err(_) = accounts {
@@ -99,27 +109,48 @@ fn extract_from_message(
         })
         .collect();
 
-    Ok((accounts, compiled_instructions, message.header))
+    Ok((accounts, compiled_instructions, message.header, config))
 }
 
+/// Returns the transaction's priority rate in micro-lamports per compute unit.
+///
+/// Legacy/V0 carry this in ComputeBudgetProgram instructions. V1 (SIMD-0385)
+/// carries a total lamport fee in the message config instead, and any
+/// ComputeBudgetProgram instruction it contains is a no-op — so V1 must be
+/// priced from `config` and never routed through here.
 fn calculate_priority_fee_details(
-    accounts: &Vec<Pubkey>,
-    instructions: &Vec<CompiledInstruction>,
-    budget: &mut ComputeBudget,
-) -> Result<PrioritizationFeeDetails, TransactionError> {
-    let instructions_for_processing: Vec<(&Pubkey, &CompiledInstruction)> = instructions
+    accounts: &[Pubkey],
+    instructions: &[CompiledInstruction],
+    feature_set: &FeatureSet,
+) -> Result<u64, TransactionError> {
+    let instructions_for_processing: Vec<(&Pubkey, SVMInstruction)> = instructions
         .iter()
         .filter_map(|ix: &CompiledInstruction| {
-            let account = accounts.get(ix.program_id_index as usize);
-            if account.is_none() {
+            let Some(account) = accounts.get(ix.program_id_index as usize) else {
                 statsd_count!("program_id_index_not_found", 1);
                 return None;
-            }
-            Some((account.unwrap(), ix))
+            };
+            Some((account, SVMInstruction::from(ix)))
         })
         .collect();
 
-    budget.process_instructions(instructions_for_processing.into_iter(), true, true)
+    process_compute_budget_instructions(instructions_for_processing.into_iter(), feature_set)
+        .map(|limits| limits.compute_unit_price)
+}
+
+/// Converts a V1 message config into the same micro-lamports-per-CU unit the
+/// rest of the tracker uses. `priority_fee` is a TOTAL in lamports, so it only
+/// yields a rate when a compute unit limit is present to divide against.
+fn v1_priority_rate(config: &TransactionConfig) -> Option<u64> {
+    let cu_limit = config.compute_unit_limit.filter(|limit| *limit > 0)?;
+    let total_lamports = config.priority_fee.unwrap_or(0);
+    Some(
+        (total_lamports as u128)
+            .saturating_mul(MICRO_LAMPORTS_PER_LAMPORT as u128)
+            .checked_div(cu_limit as u128)
+            .and_then(|rate| u64::try_from(rate).ok())
+            .unwrap_or(u64::MAX),
+    )
 }
 
 pub(crate) fn construct_writable_accounts<T>(
@@ -170,13 +201,21 @@ impl GrpcConsumer for PriorityFeeTracker {
                         statsd_count!(error.into(), 1);
                         continue;
                     }
-                    let (accounts, instructions, header) = res.unwrap();
-                    let mut compute_budget = self.compute_budget;
-                    let priority_fee_details = calculate_priority_fee_details(
-                        &accounts,
-                        &instructions,
-                        &mut compute_budget,
-                    );
+                    let (accounts, instructions, header, config) = res.unwrap();
+                    // V1 (SIMD-0385) prices from the message config; its
+                    // ComputeBudgetProgram instructions are no-ops, so running
+                    // them through the instruction processor would record 0.
+                    let priority_fee_details = match config.as_ref().and_then(v1_priority_rate) {
+                        Some(rate) => {
+                            statsd_count!("txns_priced_from_v1_config", 1);
+                            Ok(rate)
+                        }
+                        None => calculate_priority_fee_details(
+                            &accounts,
+                            &instructions,
+                            &self.feature_set,
+                        ),
+                    };
 
                     let writable_accounts = vec![
                         construct_writable_accounts(accounts, &header),
@@ -190,10 +229,10 @@ impl GrpcConsumer for PriorityFeeTracker {
                     );
                     statsd_count!("txns_processed", 1);
                     match priority_fee_details {
-                        Ok(priority_fee_details) => self.push_priority_fee_for_txn(
+                        Ok(priority_rate) => self.push_priority_fee_for_txn(
                             slot,
                             writable_accounts,
-                            priority_fee_details.get_priority(),
+                            priority_rate,
                             is_vote,
                         ),
                         Err(e) => {
@@ -213,7 +252,7 @@ impl PriorityFeeTracker {
         let tracker = Self {
             priority_fees: Arc::new(DashMap::new()),
             slot_cache: SlotCache::new(slot_cache_length),
-            compute_budget: ComputeBudget::default(),
+            feature_set: Arc::new(FeatureSet::all_enabled()),
         };
         tracker.poll_fees();
         tracker
@@ -383,7 +422,7 @@ mod tests {
     use anyhow::Context;
     use cadence::{NopMetricSink, StatsdClient};
     use cadence_macros::set_global_default;
-    use solana_sdk::compute_budget::ComputeBudgetInstruction::{
+    use solana_compute_budget_interface::ComputeBudgetInstruction::{
         RequestHeapFrame, SetComputeUnitLimit, SetComputeUnitPrice, SetLoadedAccountsDataSizeLimit,
     };
     use std::collections::HashSet;
@@ -392,6 +431,48 @@ mod tests {
         let noop = NopMetricSink {};
         let client = StatsdClient::builder("", noop).build();
         set_global_default(client)
+    }
+
+    fn v1_config(priority_fee: Option<u64>, compute_unit_limit: Option<u32>) -> TransactionConfig {
+        TransactionConfig {
+            priority_fee,
+            compute_unit_limit,
+            loaded_accounts_data_size_limit: None,
+            heap_size: None,
+        }
+    }
+
+    #[test]
+    fn test_v1_rate_matches_equivalent_v0_rate() {
+        // The SDK's v1 vector: 420 lamports total over a 42,000 CU limit is
+        // the same economic intent as a v0 txn priced at 10,000 uL/CU.
+        let rate = v1_priority_rate(&v1_config(Some(420), Some(42_000)));
+        assert_eq!(rate, Some(10_000));
+    }
+
+    #[test]
+    fn test_v1_rate_without_compute_unit_limit_is_skipped() {
+        // A total lamport fee yields no rate with nothing to divide against.
+        // Must return None so the caller falls through rather than recording 0.
+        assert_eq!(v1_priority_rate(&v1_config(Some(420), None)), None);
+    }
+
+    #[test]
+    fn test_v1_rate_with_zero_compute_unit_limit_is_skipped() {
+        // Guards the divide-by-zero: bit unset defaults the limit to 0.
+        assert_eq!(v1_priority_rate(&v1_config(Some(420), Some(0))), None);
+    }
+
+    #[test]
+    fn test_v1_rate_without_priority_fee_is_zero() {
+        // Genuinely unset priority fee is a real 0 rate, not a skip.
+        assert_eq!(v1_priority_rate(&v1_config(None, Some(42_000))), Some(0));
+    }
+
+    #[test]
+    fn test_v1_rate_saturates_instead_of_overflowing() {
+        let rate = v1_priority_rate(&v1_config(Some(u64::MAX), Some(1)));
+        assert_eq!(rate, Some(u64::MAX));
     }
 
     fn calculation1(
@@ -1676,7 +1757,6 @@ mod tests {
         }
     }
 
-    const MICRO_LAMPORTS_PER_LAMPORT: u128 = 1_000_000;
     #[test]
     fn test_budget_calculation() -> Result<(), anyhow::Error> {
         // Ok(PrioritizationFeeDetails { fee: 4923, priority: 39066 })
@@ -1711,17 +1791,12 @@ mod tests {
             (4u8, comp1, vec![0u8, 1u8].to_vec()),
         ];
 
-        let fee = calculate_priority_fee_details(
+        let rate = calculate_priority_fee_details(
             &construct_accounts(&account_keys[..])?,
             &construct_instructions(instructions.to_vec())?,
-            &mut ComputeBudget::default(),
+            &FeatureSet::all_enabled(),
         )?;
-        assert_eq!(
-            fee.get_fee() as u128,
-            (200_000 * 100_000 + MICRO_LAMPORTS_PER_LAMPORT - 1)
-                / MICRO_LAMPORTS_PER_LAMPORT as u128
-        );
-        assert_eq!(fee.get_priority(), 200_000);
+        assert_eq!(rate, 200_000);
 
         Ok::<(), anyhow::Error>(())
     }
