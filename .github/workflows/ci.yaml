@@ -26,8 +26,6 @@ jobs:
       env:
           RUST_TOOLCHAIN: stable
           CARGO_INCREMENTAL: 0
-          SCCACHE_GHA_ENABLED: 'true'
-          RUSTC_WRAPPER: 'sccache'
           ENV: 'test'
       steps:
           - uses: actions/checkout@v4
@@ -44,10 +42,6 @@ jobs:
             with:
                 rustflags: '-C link-arg=-fuse-ld=lld'
                 components: rustfmt, clippy
-          - name: Set up sccache
-            uses: mozilla-actions/sccache-action@v0.0.3
-          - name: Clear sccache stats
-            run: sccache --zero-stats
           - name: Run Tests
             run: |
                 cargo test -- --nocapture
