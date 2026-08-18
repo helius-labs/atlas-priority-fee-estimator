@@ -13,6 +13,7 @@ use yellowstone_grpc_proto::prelude::{
     SubscribeRequestPing,
 };
 use yellowstone_grpc_proto::tonic::codec::CompressionEncoding;
+use yellowstone_grpc_proto::tonic::transport::ClientTlsConfig;
 
 use crate::grpc_consumer::GrpcConsumer;
 
@@ -50,6 +51,8 @@ impl GrpcGeyserImpl {
                     let grpc_client = GeyserGrpcClient::build_from_shared(endpoint.clone())
                         .unwrap()
                         .x_token(auth_header.clone())
+                        .unwrap()
+                        .tls_config(ClientTlsConfig::new().with_native_roots())
                         .unwrap()
                         .connect_timeout(Duration::from_secs(10))
                         .max_decoding_message_size(50_000_000)
