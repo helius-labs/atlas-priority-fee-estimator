@@ -2,6 +2,10 @@
 
 This repo contains the RPC service that supports the `getPriorityFeeEstimate` method. This method returns the estimated priority fee for a transaction to be included in the next block. The service uses historical priority fee data to estimate the fee.
 
+The service analyzes successful, non-vote transactions from the most recent 150 slots. Legacy and V0 transactions are priced from their compute-budget instructions. V1 transactions are priced from the transaction config's total priority fee divided by its compute-unit limit; that limit is capped at the runtime maximum of 1,400,000 compute units.
+
+The API response combines all transaction versions. For operational attribution, the service also emits `priority_fee_by_version` (tagged by `transaction_version` and `level`), `priority_fee_sample_count_by_version` (tagged by `transaction_version`), and `v1_config_compute_unit_limit` (tagged by `bucket`). `legacy_v0` and `v1` are reported separately without changing the API calculation.
+
 See a further description of functionality [here](https://docs.helius.dev/solana-rpc-nodes/alpha-priority-fee-api)
 
 #### Running the service

@@ -2,22 +2,23 @@ use crate::errors::TransactionValidationError;
 use crate::grpc_consumer::GrpcConsumer;
 use crate::model::{
     Fees, MicroLamportPriorityFeeDetails, MicroLamportPriorityFeeEstimates, PriorityFeesBySlot,
-    PriorityLevel, SlotPriorityFees,
+    PriorityLevel, SlotPriorityFees, TransactionVersion,
 };
 use crate::priority_fee_calculation::Calculations;
 use crate::priority_fee_calculation::Calculations::Calculation2;
 use crate::rpc_server::get_recommended_fee;
 use crate::slot_cache::SlotCache;
+use agave_feature_set::FeatureSet;
 use cadence_macros::statsd_count;
 use cadence_macros::statsd_gauge;
 use dashmap::DashMap;
 use solana::storage::confirmed_block::{Message, TransactionConfig};
-use agave_feature_set::FeatureSet;
+use solana_compute_budget::compute_budget_limits::MAX_COMPUTE_UNIT_LIMIT;
 use solana_compute_budget_instruction::instructions_processor::process_compute_budget_instructions;
 use solana_message::compiled_instruction::CompiledInstruction;
+use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use solana_svm_transaction::instruction::SVMInstruction;
 use solana_transaction_error::TransactionError;
-use solana_sdk::{pubkey::Pubkey, slot_history::Slot};
 use statrs::statistics::{Data, Distribution, OrderStatistics};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -142,15 +143,30 @@ fn calculate_priority_fee_details(
 /// rest of the tracker uses. `priority_fee` is a TOTAL in lamports, so it only
 /// yields a rate when a compute unit limit is present to divide against.
 fn v1_priority_rate(config: &TransactionConfig) -> Option<u64> {
-    let cu_limit = config.compute_unit_limit.filter(|limit| *limit > 0)?;
+    let cu_limit = config
+        .compute_unit_limit
+        .filter(|limit| *limit > 0)?
+        .min(MAX_COMPUTE_UNIT_LIMIT);
     let total_lamports = config.priority_fee.unwrap_or(0);
     Some(
         (total_lamports as u128)
             .saturating_mul(MICRO_LAMPORTS_PER_LAMPORT as u128)
             .checked_div(cu_limit as u128)
             .and_then(|rate| u64::try_from(rate).ok())
-            .unwrap_or(u64::MAX),
+            .unwrap_or(0),
     )
+}
+
+fn compute_unit_limit_bucket(limit: Option<u32>) -> &'static str {
+    match limit {
+        None => "missing",
+        Some(0) => "zero",
+        Some(1..=100) => "1_100",
+        Some(101..=1_000) => "101_1000",
+        Some(1_001..=100_000) => "1001_100000",
+        Some(100_001..=MAX_COMPUTE_UNIT_LIMIT) => "100001_runtime_max",
+        Some(_) => "above_runtime_max",
+    }
 }
 
 /// Resolves a transaction's priority rate in micro-lamports per compute unit,
@@ -235,6 +251,18 @@ impl GrpcConsumer for PriorityFeeTracker {
                         continue;
                     }
                     let (accounts, instructions, header, config) = res.unwrap();
+                    let transaction_version = if config.is_some() {
+                        statsd_count!(
+                            "v1_config_compute_unit_limit",
+                            1,
+                            "bucket" => compute_unit_limit_bucket(
+                                config.as_ref().and_then(|config| config.compute_unit_limit)
+                            )
+                        );
+                        TransactionVersion::V1
+                    } else {
+                        TransactionVersion::LegacyV0
+                    };
                     let priority_rate = resolve_priority_rate(
                         config.as_ref(),
                         &accounts,
@@ -254,11 +282,12 @@ impl GrpcConsumer for PriorityFeeTracker {
                     );
                     statsd_count!("txns_processed", 1);
                     if let Some(priority_rate) = priority_rate {
-                        self.push_priority_fee_for_txn(
+                        self.push_priority_fee_for_txn_with_version(
                             slot,
                             writable_accounts,
                             priority_rate,
                             is_vote,
+                            transaction_version,
                         );
                     }
                 }
@@ -331,6 +360,61 @@ impl PriorityFeeTracker {
                 "account" => "none"
             );
         }
+
+        self.record_version_fees();
+    }
+
+    fn record_version_fees(&self) {
+        for version in TransactionVersion::ALL {
+            let Some((fees, count)) = self.calculate_version_priority_fee(version) else {
+                continue;
+            };
+            let version = version.as_tag();
+            for (level, value) in [
+                ("min", fees.min),
+                ("low", fees.low),
+                ("medium", fees.medium),
+                ("high", fees.high),
+                ("very_high", fees.very_high),
+                ("unsafe_max", fees.unsafe_max),
+            ] {
+                statsd_gauge!(
+                    "priority_fee_by_version",
+                    value as u64,
+                    "transaction_version" => version,
+                    "level" => level
+                );
+            }
+            statsd_gauge!(
+                "priority_fee_sample_count_by_version",
+                count as u64,
+                "transaction_version" => version
+            );
+        }
+    }
+
+    fn calculate_version_priority_fee(
+        &self,
+        version: TransactionVersion,
+    ) -> Option<(MicroLamportPriorityFeeEstimates, usize)> {
+        let mut fees = Vec::new();
+        for slot in self.priority_fees.iter() {
+            if let Some(version_fees) = slot.version_fees.get(&version) {
+                fees.extend_from_slice(&version_fees.non_vote_fees);
+            }
+        }
+        let count = fees.len();
+        if count == 0 {
+            return None;
+        }
+
+        Some((
+            estimate_max_values(
+                &mut Data::new(fees),
+                MicroLamportPriorityFeeEstimates::default(),
+            ),
+            count,
+        ))
     }
 
     pub fn push_priority_fee_for_txn(
@@ -340,18 +424,42 @@ impl PriorityFeeTracker {
         priority_fee: u64,
         is_vote: bool,
     ) {
+        self.push_priority_fee_for_txn_with_version(
+            slot,
+            accounts,
+            priority_fee,
+            is_vote,
+            TransactionVersion::LegacyV0,
+        );
+    }
+
+    fn push_priority_fee_for_txn_with_version(
+        &self,
+        slot: Slot,
+        accounts: Vec<Pubkey>,
+        priority_fee: u64,
+        is_vote: bool,
+        transaction_version: TransactionVersion,
+    ) {
         // update the slot cache so we can keep track of the slots we have processed in order
         // for removal later
         let slot_to_remove = self.slot_cache.push_pop(slot);
         if !self.priority_fees.contains_key(&slot) {
             self.priority_fees.insert(
                 slot,
-                SlotPriorityFees::new(slot, accounts, priority_fee, is_vote),
+                SlotPriorityFees::new_with_version(
+                    slot,
+                    accounts,
+                    priority_fee,
+                    is_vote,
+                    transaction_version,
+                ),
             );
         } else {
             // update the slot priority fees
             self.priority_fees.entry(slot).and_modify(|priority_fees| {
                 priority_fees.fees.add_fee(priority_fee as f64, is_vote);
+                priority_fees.add_version_fee(transaction_version, priority_fee, is_vote);
                 for account in accounts {
                     priority_fees
                         .account_fees
@@ -492,9 +600,30 @@ mod tests {
     }
 
     #[test]
-    fn test_v1_rate_saturates_instead_of_overflowing() {
+    fn test_v1_rate_clamps_compute_unit_limit_like_runtime() {
+        let rate = v1_priority_rate(&v1_config(Some(3_240_000), Some(4_200_000)));
+        assert_eq!(rate, Some(2_314_285));
+    }
+
+    #[test]
+    fn test_v1_rate_matches_runtime_overflow_fallback() {
         let rate = v1_priority_rate(&v1_config(Some(u64::MAX), Some(1)));
-        assert_eq!(rate, Some(u64::MAX));
+        assert_eq!(rate, Some(0));
+    }
+
+    #[test]
+    fn test_v1_compute_unit_limit_buckets_include_runtime_clamp() {
+        assert_eq!(compute_unit_limit_bucket(None), "missing");
+        assert_eq!(compute_unit_limit_bucket(Some(0)), "zero");
+        assert_eq!(compute_unit_limit_bucket(Some(24)), "1_100");
+        assert_eq!(
+            compute_unit_limit_bucket(Some(MAX_COMPUTE_UNIT_LIMIT)),
+            "100001_runtime_max"
+        );
+        assert_eq!(
+            compute_unit_limit_bucket(Some(MAX_COMPUTE_UNIT_LIMIT + 1)),
+            "above_runtime_max"
+        );
     }
 
     /// An unpriceable V1 sample must be dropped, not recorded as 0. Falling
@@ -528,6 +657,45 @@ mod tests {
             resolve_priority_rate(Some(&config), &[], &[], &FeatureSet::all_enabled()),
             Some(10_000)
         );
+    }
+
+    #[tokio::test]
+    async fn test_version_fee_breakdown_preserves_separate_populations() {
+        init_metrics();
+        let tracker = PriorityFeeTracker::new(150);
+
+        for fee in 1..=100 {
+            tracker.push_priority_fee_for_txn(1, vec![], fee, false);
+        }
+        for _ in 0..10 {
+            tracker.push_priority_fee_for_txn_with_version(
+                1,
+                vec![],
+                13_500_000,
+                false,
+                TransactionVersion::V1,
+            );
+        }
+        tracker.push_priority_fee_for_txn_with_version(
+            1,
+            vec![],
+            99_000_000,
+            true,
+            TransactionVersion::V1,
+        );
+
+        let (legacy_v0, legacy_v0_count) = tracker
+            .calculate_version_priority_fee(TransactionVersion::LegacyV0)
+            .unwrap();
+        let (v1, v1_count) = tracker
+            .calculate_version_priority_fee(TransactionVersion::V1)
+            .unwrap();
+
+        assert_eq!(legacy_v0_count, 100);
+        assert_eq!(legacy_v0.unsafe_max, 100.0);
+        assert_eq!(v1_count, 10);
+        assert_eq!(v1.very_high, 13_500_000.0);
+        assert_eq!(v1.unsafe_max, 13_500_000.0);
     }
 
     /// Legacy/V0 carry no config and must still resolve through the
