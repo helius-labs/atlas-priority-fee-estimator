@@ -2,6 +2,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use solana_sdk::clock::Slot;
 use solana_sdk::pubkey::Pubkey;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -44,6 +45,23 @@ impl Into<Percentile> for PriorityLevel {
 }
 
 pub type Percentile = usize;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TransactionVersion {
+    LegacyV0,
+    V1,
+}
+
+impl TransactionVersion {
+    pub const ALL: [Self; 2] = [Self::LegacyV0, Self::V1];
+
+    pub const fn as_tag(self) -> &'static str {
+        match self {
+            Self::LegacyV0 => "legacy_v0",
+            Self::V1 => "v1",
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialOrd, PartialEq, Eq, Ord, Hash)]
 pub enum DataType<'a> {
@@ -118,28 +136,52 @@ pub struct SlotPriorityFees {
     pub(crate) slot: Slot,
     pub(crate) fees: Fees,
     pub(crate) account_fees: DashMap<Pubkey, Fees>,
+    pub(crate) version_fees: HashMap<TransactionVersion, Fees>,
 }
 
 impl SlotPriorityFees {
+    #[cfg(test)]
     pub(crate) fn new(slot: Slot, accounts: Vec<Pubkey>, priority_fee: u64, is_vote: bool) -> Self {
+        Self::new_with_version(
+            slot,
+            accounts,
+            priority_fee,
+            is_vote,
+            TransactionVersion::LegacyV0,
+        )
+    }
+
+    pub(crate) fn new_with_version(
+        slot: Slot,
+        accounts: Vec<Pubkey>,
+        priority_fee: u64,
+        is_vote: bool,
+        version: TransactionVersion,
+    ) -> Self {
         let account_fees = DashMap::new();
         let fees = Fees::new(priority_fee as f64, is_vote);
+        let version_fees = HashMap::from([(version, fees.clone())]);
         for account in accounts {
             account_fees.insert(account, fees.clone());
         }
-        if is_vote {
-            Self {
-                slot,
-                fees,
-                account_fees,
-            }
-        } else {
-            Self {
-                slot,
-                fees,
-                account_fees,
-            }
+        Self {
+            slot,
+            fees,
+            account_fees,
+            version_fees,
         }
+    }
+
+    pub(crate) fn add_version_fee(
+        &mut self,
+        version: TransactionVersion,
+        priority_fee: u64,
+        is_vote: bool,
+    ) {
+        self.version_fees
+            .entry(version)
+            .and_modify(|fees| fees.add_fee(priority_fee as f64, is_vote))
+            .or_insert_with(|| Fees::new(priority_fee as f64, is_vote));
     }
 }
 
