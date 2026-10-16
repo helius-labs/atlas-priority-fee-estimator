@@ -1,0 +1,51 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: priority-fee-estimator-production-dispatch
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Dispatch production deployment
+    if: github.repository == 'helius-labs/atlas-priority-fee-estimator'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Dispatch exact revision to the deployment workflow
+        env:
+          MONOREPO_ACTIONS_TOKEN: ${{ secrets.MONOREPO_ACTIONS_TOKEN }}
+          SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$MONOREPO_ACTIONS_TOKEN" ]]; then
+            echo '::error::MONOREPO_ACTIONS_TOKEN is not configured'
+            exit 1
+          fi
+
+          payload="$(jq -n \
+            --arg revision "$SOURCE_REVISION" \
+            --arg description "Automatic deployment after atlas-priority-fee-estimator main advanced to $SOURCE_REVISION" \
+            '{ref: "main", inputs: {revision: $revision, target: "all", description: $description}}')"
+          response="$RUNNER_TEMP/deployment-dispatch-response.json"
+          status="$(curl --silent --show-error \
+            --output "$response" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header 'Accept: application/vnd.github+json' \
+            --header "Authorization: Bearer $MONOREPO_ACTIONS_TOKEN" \
+            --header 'X-GitHub-Api-Version: 2022-11-28' \
+            --data-binary "$payload" \
+            'https://api.github.com/repos/helius-labs/monorepo/actions/workflows/deploy-priority-fee-estimator.yml/dispatches')"
+          if [[ "$status" != 204 ]]; then
+            echo "::error::Deployment dispatch failed with HTTP $status"
+            jq -r '.message // "GitHub returned no error message"' "$response" >&2
+            exit 1
+          fi
+
+          echo "Dispatched production deployment for $SOURCE_REVISION"
